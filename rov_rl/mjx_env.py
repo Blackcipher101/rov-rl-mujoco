@@ -118,7 +118,10 @@ class RovMjxEnv(mjx_env.MjxEnv):
         integral = core.update_integral(jnp, state.info["integral"], jnp.nan_to_num(err.pos_err_world_m), self._sim)
         obs = core.observation(jnp, data.qpos, data.qvel, ref, integral, action, self._sim)
         info = {**state.info, "t_s": t_next, "integral": integral, "last_action": action}
+        # Start from the incoming metrics: brax wrappers add keys (e.g. 'reward' in EvalWrapper) and jax.lax.scan needs
+        # the same pytree structure on every step.
         metrics = {
+            **state.metrics,
             **{k: jnp.nan_to_num(v) for k, v in terms.items()},
             "pos_err_m": jnp.nan_to_num(err.pos_err_m, nan=self._reward_cfg.max_pos_error_m),
             "thrust_impulse_ns": jnp.sum(impulses),
