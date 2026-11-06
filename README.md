@@ -32,6 +32,11 @@ with a murky-water look.
 | `scripts/tune_pid.py` | PID gain tuning (CPU) |
 | `scripts/derive_hydro_params.py` | derives the MJCF inertia / viscosity values from the published damping |
 | `tests/` | fluid sanity, allocation, reward, core logic, CPU env + PID regression, MJX-vs-CPU parity |
+| `rov_rl/nav_core.py` | nav task (see [Navigation](#local-planning--obstacle-avoidance-with-sonar-nav-task)): obstacle fields, analytic sonar, clearance, reward, shared velocity controller |
+| `rov_rl/nav_cpu_env.py`, `rov_rl/nav_mjx_env.py` | nav CPU env (+ scene model for rendering / ray checks) and MJX env |
+| `rov_rl/nav_baseline.py` | VFH+ planner over a sonar-built occupancy grid; parameters in `config/nav_baseline.json` |
+| `rov_rl/nav_rollout.py`, `rov_rl/nav_render.py` | nav episode runner and metrics, sonar-fan videos, overhead path plot |
+| `eval_nav.py`, `scripts/tune_nav_baseline.py` | nav evaluation (RL vs VFH+), baseline tuning (CPU) |
 
 ## Vehicle model
 
@@ -291,3 +296,156 @@ Not run anywhere yet:
 * **Simulation only.** This is not a hardware-validated controller. Any transfer to a real
   vehicle needs added-mass-aware re-validation, sensor noise and latency, a state estimator,
   and staged in-water testing.
+
+## Local planning / obstacle avoidance with sonar (nav task)
+
+A second task, separate from station keeping and tracking: reach a goal 15-30 m away through a random
+obstacle field, using only a simulated forward-looking sonar and the usual navigation sensors. An RL policy
+(MJX + Brax PPO) is compared with a classical VFH+ planner. Both see the same sensor data, run on the same
+episodes, and drive the same velocity controller.
+
+### Scene
+
+* **Layout:** start at the origin, facing the goal within +-0.6 rad. The goal bearing is random, its height
+  within +-1 m. The seabed lies 2.5-4.5 m below the start, and the nominal surface is 30 m above it.
+* **Obstacles** (`config.NavSceneConfig`) sit on a jittered 6 x 4 lattice inside a +-5 m corridor around the
+  start-goal line. Each slot holds, with probability `slot_density`, one of:
+  * a pillar or pile: a vertical capsule from below the seabed to the surface, radius 0.2-0.6 m;
+  * a rock or wreck part: a yawed box resting on the seabed, 0.6-2.4 m wide and 0.6-5 m tall. Some reach the
+    vehicle's depth, the others can be passed over.
+* **Pipe spans:** up to two horizontal capsules cross the corridor near the vehicle's depth (radius
+  0.2-0.4 m, 8-16 m long).
+* **Feasibility:** the corridor is open at the sides, so a path around the field always exists. Obstacles
+  closer than 1.5 m (surface distance, beyond the vehicle's bounding radius) to the start or the goal are
+  removed; `tests/test_nav_scene.py` checks this.
+* **Density levels** (slot occupancy / pipe probability): low 0.2 / 0.2, medium 0.4 / 0.45, high 0.6 / 0.7.
+  Training samples densities from 0.1 to 0.65.
+* **Current:** the existing current model. Training uses 0-0.25 m/s constant plus a 0-0.08 m/s sinusoid,
+  with the plant randomisation of the control task and no thruster failures. Evaluation uses current levels
+  0, 2 and 3 (0, 0.2 and 0.3 m/s); level 3 is outside the training range.
+* **Collision:** the vehicle's bounding sphere (radius 0.416 m, half the diagonal of the published
+  envelope) touches an obstacle or the seabed. This is conservative at the corners. Contacts stay disabled in
+  the physics, and a collision ends the episode.
+
+### Sensing (no privileged obstacle information)
+
+* **Sonar fan:** 48 beams over 120 deg, 12 m maximum range, mounted 0.2 m ahead of the CoG. Each beam is cast
+  at 5 elevations (-10 to +10 deg) and reports the nearest echo. Like an imaging sonar, it cannot tell at
+  which elevation inside its 20 deg vertical aperture the echo came from.
+* **Vertical beams:** an altimeter (down) and an up-looking beam.
+* **Noise:** range noise with std 0.05 m + 1 % of the range. 3 % of returns drop out and read "no echo"
+  (maximum range), which looks like free space.
+* **Navigation sensors:** DVL body velocity (noise 0.02 m/s), gyro rates, gravity direction (roll and
+  pitch), compass yaw, depth, and the goal vector in the body frame. The goal vector stands for an INS / USBL
+  navigation solution and has no noise.
+* **Observation:** 70 values (`nav_core.nav_observation`): the 48 normalised fan ranges, the 2 vertical
+  ranges, the navigation sensors, and the previous command.
+* **Rays are analytic, not MuJoCo sensors.** In mujoco-mjx 3.17 (`_src/ray.py`, read from the wheel), `ray`
+  handles PLANE, SPHERE, CAPSULE, ELLIPSOID, BOX and MESH. It **silently skips CYLINDER**, and the MJX
+  rangefinder sensor uses the same function. The scene therefore uses only capsules, boxes and the seabed
+  plane. Rays and clearances are computed in closed form in `nav_core.py`, one backend-agnostic code path
+  for the CPU and MJX envs. The obstacles never enter the physics model.
+  * `tests/test_nav_geometry.py` checks the rays against analytic distances and against `mujoco.mj_ray` on a
+    compiled scene model (up to 400 random rays per scene; agreement within 1e-6 m).
+  * `tests/test_nav_mjx_parity.py` checks them against `mjx.ray`. It needs JAX, so it is skipped on the
+    laptop.
+
+### Actions, reward, training
+
+* **Action:** a normalised velocity command (surge +-0.6, sway +-0.3, heave +-0.3 m/s, yaw rate
+  +-0.6 rad/s).
+* **Velocity controller** (`nav_core.command_to_thrust`): it converts the command to the 8 thruster
+  commands. It is the inner loop of the cascade PID (velocity P with drag and buoyancy feed-forward, yaw-rate
+  P, roll / pitch PD, pseudo-inverse allocation) with the tuned gains from `config/pid_gains.json`.
+  `tests/test_nav_baseline.py` checks that it is equivalent to `CascadePid.wrench`. RL and the baseline both
+  use it, so the comparison is planner against planner.
+* **Reward** (`config.NavRewardConfig`):
+  * +2 per metre of progress towards the goal
+  * +25 on success (within 1 m of the goal)
+  * -50 on collision, tilt beyond 60 deg, or a non-finite state
+  * -0.05 x (1 - clearance / 1 m)^2 when closer than 1 m to an obstacle
+  * small effort, command-rate, time and tilt penalties
+* **Episodes** end on success, collision or failure, or time out after 100 s (2500 control steps at
+  25 Hz).
+* **PPO** (`python train.py --task nav`): the same networks and hyper-parameters as the control task,
+  except gamma = 0.995 (an 8 s horizon). The full preset is 300 M steps.
+* **No memory:** the policy is a memoryless MLP. It sees only the current scan, so an obstacle that has left
+  the 120 deg fan is forgotten. No frame stack or recurrent policy is used. If the evaluation shows
+  collisions caused by side or near-field blind spots, a short frame stack of the fan is the first thing to
+  add.
+
+### Classical baseline: VFH+ over a sonar occupancy grid (`rov_rl/nav_baseline.py`)
+
+* **Same inputs:** the planner reads only the `NavMeasurement` the observation is built from.
+* **Pose:** its pose in a goal-centred frame is -R(roll, pitch, yaw) x goal_body, the same navigation
+  solution the policy gets.
+* **Occupancy grid:** a 0.25 m log-odds grid. Echoes are placed in the horizontal plane. Echoes at the range
+  where the lowest elevation row meets the seabed (from the altimeter) are rejected as seabed.
+* **VFH+** (Ulrich & Borenstein 1998): an enlarged polar histogram inside a window, hysteresis thresholds,
+  candidate directions at valley borders, centres and the goal direction, and a cost on goal, heading and
+  previous-choice deviation.
+* **Command:** turn to the chosen direction, surge when aligned, slow down by the nearest forward echo, back
+  off inside the stop range. Depth is held on the goal height with an altimeter floor and an up-beam ceiling.
+* **Memory:** the grid remembers obstacles outside the fan; the MLP policy has no such memory.
+* **Tuning:** `scripts/tune_nav_baseline.py` runs a coordinate search on 24 tuning episodes (seed 7, current
+  levels 1 and 3, all densities). These are disjoint from the evaluation episodes (seed 2024). The result
+  and its provenance note are in `config/nav_baseline.json`.
+
+### Metrics (`eval_nav.py`, `rov_rl/nav_rollout.py`)
+
+* **Cells:** density (low / medium / high) x current level (0 / 2 / 3), 20 episodes per cell by default.
+  RL and VFH+ see identical fields, currents and sensor-noise sequences.
+* **Rates:** success, collision and timeout (incl. tilt failure) over all episodes.
+* **Means over successful episodes:**
+  * time to goal
+  * path ratio: path length / straight start-goal distance. The 1 m goal radius lets a direct run come in
+    slightly below 1.
+  * thrust impulse (the energy proxy)
+* **Min clearance:** the true gap between the bounding sphere and the nearest obstacle or the seabed, as
+  mean and worst over all episodes.
+* **Outputs:** `runs/<stage>/nav_eval/metrics.json` and `results.md` (rewritten after every cell), plus
+  `videos/`:
+  * chase camera, murky look, sonar fan coloured by range (red near, yellow, green far; faint cyan = no
+    echo), travelled path, goal and current arrow
+  * one clip per controller and `*_rl_vs_baseline.mp4` side by side
+* **Overhead plot:** `paths_<cell>.png` shows one field with both paths.
+
+### Running
+
+```bash
+# laptop / CPU: tests (MJX parity skipped), baseline-only evaluation, baseline tuning
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q
+python eval_nav.py --controllers baseline --episodes 2 --out-dir outputs/nav_baseline --no-video
+python scripts/tune_nav_baseline.py --out config/nav_baseline.json
+# GPU workstation
+MJRL_VENV=~/.venvs/mjrl scripts/run_ws1.sh nav_smoke   # tests, 2 M-step training, short eval + video + plot
+MJRL_VENV=~/.venvs/mjrl scripts/run_ws1.sh nav_full    # 300 M-step training, full evaluation
+tail -f runs/nav_full/train.log runs/nav_full/nav_eval.log
+```
+
+### Status
+
+* **Run on the laptop** (CPU, mujoco 3.17.0, numpy 1.26.4, no JAX):
+  * the full pytest suite, including the nav tests. Rays agree with `mujoco.mj_ray`; the MJX parity tests
+    are skipped.
+  * baseline tuning and baseline-only evaluation smoke runs
+  * EGL rendering of nav frames and the overhead plot
+* **Not run yet:**
+  * the MJX nav env and the nav parity tests
+  * PPO training on the nav task
+  * the RL evaluation
+  * MP4 encoding of nav videos
+* **No nav results are reported yet.**
+
+### Nav-task limitations
+
+* **Ideal sonar:** each beam is a thin ray. There is no beam width, no multipath, no acoustic shadowing
+  model, no blanking distance and no scan-rate latency (a full fan every 40 ms).
+* **Ideal navigation:** the goal vector (INS / USBL solution) and the attitude are noise-free. Only the sonar
+  ranges and the DVL are noisy.
+* **Ideal inner loop:** the low-level velocity controller uses the true velocity, as the control-task PID
+  does.
+* **Conservative collision:** the bounding sphere flags some near misses as collisions; there is no contact
+  dynamics.
+* **Simplified scene:** pipe spans float without supports, and obstacles may overlap one another (rock
+  piles); only the start and goal keep-out is enforced.

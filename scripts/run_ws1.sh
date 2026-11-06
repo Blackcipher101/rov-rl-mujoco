@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # Train + evaluate on the GPU workstation (headless).
 #
-# Usage:  scripts/run_ws1.sh [smoke|full|all]      (default: all = smoke, then full)
+# Usage:  scripts/run_ws1.sh [smoke|full|all|nav_smoke|nav_full|nav]
+#           smoke / full / all (default: all = smoke, then full): station keeping + tracking (control task)
+#           nav_smoke / nav_full / nav (= nav_smoke, then nav_full): sonar obstacle avoidance, RL vs VFH+
 # Env:    MJRL_VENV  (default: $HOME/.venvs/mjrl)  venv with jax[cuda12], mujoco,
-#                    mujoco-mjx, playground, brax, imageio, imageio-ffmpeg, pytest
+#                    mujoco-mjx, playground, brax, imageio, imageio-ffmpeg, pytest (+ matplotlib for nav plots)
 #         RUNS_DIR   (default: <repo>/runs)
-#         EVAL_EPISODES (default: 20) episodes per evaluation cell in the full stage
+#         EVAL_EPISODES (default: 20) episodes per evaluation cell in the full stages
+#         XLA_PYTHON_CLIENT_PREALLOCATE (default: false) so training can share the GPU with other jobs
 #
 # Every stage streams line-by-line progress (python -u) and is tee'd to a log
 # file under $RUNS_DIR, so `tail -f` works while it runs.
@@ -19,8 +22,8 @@ STAGE="${1:-all}"
 PY="$VENV/bin/python"
 
 case "$STAGE" in
-  smoke|full|all) ;;
-  *) echo "usage: $0 [smoke|full|all]" >&2; exit 2 ;;
+  smoke|full|all|nav_smoke|nav_full|nav) ;;
+  *) echo "usage: $0 [smoke|full|all|nav_smoke|nav_full|nav]" >&2; exit 2 ;;
 esac
 if [[ ! -x "$PY" ]]; then
   echo "error: no python at $PY (set MJRL_VENV)" >&2
@@ -28,6 +31,7 @@ if [[ ! -x "$PY" ]]; then
 fi
 
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
+export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-false}"
 export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1  # avoid unrelated site plugins (e.g. ROS launch_testing)
 cd "$REPO_DIR"
 mkdir -p "$RUNS_DIR"
@@ -39,7 +43,7 @@ banner "environment"
 "$PY" -u - <<'EOF' 2>&1 | tee "$RUNS_DIR/environment.log"
 import importlib, platform
 print("python", platform.python_version())
-for mod in ("mujoco", "mujoco.mjx", "jax", "brax", "mujoco_playground", "imageio"):
+for mod in ("mujoco", "mujoco.mjx", "jax", "brax", "mujoco_playground", "imageio", "PIL", "matplotlib"):
     try:
         m = importlib.import_module(mod)
         print(f"{mod:18s} {getattr(m, '__version__', 'n/a')}")
@@ -74,9 +78,34 @@ run_full() {
   banner "full: results table -> $out/eval/results.md"
 }
 
+run_nav_smoke() {
+  local out="$RUNS_DIR/nav_smoke"
+  mkdir -p "$out"
+  banner "nav_smoke: train"
+  "$PY" -u train.py --task nav --preset smoke --out-dir "$out" 2>&1 | tee "$out/train.log"
+  banner "nav_smoke: eval (RL vs VFH+)"
+  JAX_PLATFORMS=cpu "$PY" -u eval_nav.py --controllers baseline,rl --policy-dir "$out/policy" \
+    --episodes 2 --densities low,high --current-levels 0,2 \
+    --video-cells high_L2 --plot-cell high_L2 --out-dir "$out/nav_eval" 2>&1 | tee "$out/nav_eval.log"
+}
+
+run_nav_full() {
+  local out="$RUNS_DIR/nav_full"
+  mkdir -p "$out"
+  banner "nav_full: train"
+  "$PY" -u train.py --task nav --preset full --out-dir "$out" 2>&1 | tee "$out/train.log"
+  banner "nav_full: eval (RL vs VFH+)"
+  JAX_PLATFORMS=cpu "$PY" -u eval_nav.py --controllers baseline,rl --policy-dir "$out/policy" \
+    --episodes "$EVAL_EPISODES" --out-dir "$out/nav_eval" 2>&1 | tee "$out/nav_eval.log"
+  banner "nav_full: results table -> $out/nav_eval/results.md"
+}
+
 case "$STAGE" in
   smoke) run_smoke ;;
   full) run_full ;;
   all) run_smoke; run_full ;;
+  nav_smoke) run_nav_smoke ;;
+  nav_full) run_nav_full ;;
+  nav) run_nav_smoke; run_nav_full ;;
 esac
 banner "done ($STAGE)"
