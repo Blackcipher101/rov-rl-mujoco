@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rov-rl-mujoco"
+version = "0.1.0"
+description = "RL (MJX + Brax PPO) vs cascade-PID control of a BlueROV2-Heavy-like ROV in MuJoCo"
+requires-python = ">=3.10"
+dependencies = ["mujoco>=3.3", "numpy"]
+
+[project.optional-dependencies]
+train = ["jax", "mujoco-mjx", "playground", "brax", "ml-collections"]
+video = ["imageio", "imageio-ffmpeg"]
+test = ["pytest"]
+
+[tool.setuptools]
+packages = ["rov_rl"]
+
+[tool.setuptools.package-data]
+rov_rl = ["assets/*.xml"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
