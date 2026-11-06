@@ -349,6 +349,10 @@ episodes, and drive the same velocity controller.
     compiled scene model (up to 400 random rays per scene; agreement within 1e-6 m).
   * `tests/test_nav_mjx_parity.py` checks them against `mjx.ray`. It needs JAX, so it is skipped on the
     laptop.
+  * **No matmul in `nav_core.py`.** On the RTX 5080, JAX's default float32 matmul precision may use TF32
+    (~1e-3 relative error). Ray discriminants cancel badly, so `@` products turned grazing misses into hits
+    and made the first ws1 parity run show MJX ranges up to 0.9 m short. All products are now elementwise;
+    a test guards this, and `scripts/diag_nav_parity.py` compares CPU and JAX ray by ray on the GPU.
 
 ### Actions, reward, training
 

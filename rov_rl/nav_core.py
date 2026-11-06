@@ -107,13 +107,35 @@ def _sym(u: Array, half_range: float) -> Array:
     return (2.0 * u - 1.0) * half_range
 
 
+# --- small linear algebra without matmul -------------------------------------------------------------------
+# No `@` / einsum anywhere in this module: on GPUs JAX's default float32 matmul precision may use TF32 (10-bit
+# mantissa, ~1e-3 relative error). Ray-quadratic discriminants cancel catastrophically (b^2 - c with b ~ 10 m),
+# so TF32 products turned grazing misses into hits and made MJX ranges up to ~0.9 m short of the CPU env.
+# Elementwise multiply + sum is always evaluated in full precision. tests/test_nav_geometry.py guards this.
+
+
+def _pair_dot(xp: ModuleType, a: Array, b: Array) -> Array:
+    """(M, 3) x (C, 3) -> (M, C) pairwise dot products."""
+    return xp.sum(a[:, None, :] * b[None, :, :], axis=-1)
+
+
+def _mv(xp: ModuleType, m: Array, v: Array) -> Array:
+    """m @ v for a (3, 3) matrix and a (3,) vector."""
+    return xp.sum(m * v[None, :], axis=-1)
+
+
+def _mtv(xp: ModuleType, m: Array, v: Array) -> Array:
+    """m.T @ v for a (3, 3) matrix and a (3,) vector."""
+    return xp.sum(m * v[:, None], axis=0)
+
+
 # --- geometry: rays ----------------------------------------------------------------------------------------
 
 
 def _first_positive_sphere_hit(xp: ModuleType, o: Array, d: Array, center: Array, r: Array) -> Array:
     """Entry distance of unit rays d (M, 3) from o (3,) into spheres (C,); _NO_HIT if none. Shape (M, C)."""
     oc = o[None, :] - center  # (C, 3)
-    b = d @ oc.T  # (M, C)
+    b = _pair_dot(xp, d, oc)  # (M, C)
     c = xp.sum(oc**2, axis=-1) - r**2  # (C,)
     h = b**2 - c[None, :]
     t = -b - xp.sqrt(xp.maximum(h, 0.0))
@@ -132,11 +154,11 @@ def ray_capsules(xp: ModuleType, o: Array, d: Array, a: Array, b: Array, r: Arra
     length = xp.sqrt(xp.sum(ba**2, axis=-1))  # (C,)
     n = ba / xp.maximum(length, _EPS)[:, None]
     oa = o[None, :] - a  # (C, 3)
-    d_ax = d @ n.T  # (M, C) axial component of the ray direction
+    d_ax = _pair_dot(xp, d, n)  # (M, C) axial component of the ray direction
     oa_ax = xp.sum(oa * n, axis=-1)  # (C,)
     oa_perp = oa - oa_ax[:, None] * n  # (C, 3)
     qa = 1.0 - d_ax**2  # |d_perp|^2 for unit d
-    qb = d @ oa_perp.T  # d_perp . oa_perp == d . oa_perp, (M, C)
+    qb = _pair_dot(xp, d, oa_perp)  # d_perp . oa_perp == d . oa_perp, (M, C)
     qc = xp.sum(oa_perp**2, axis=-1) - r**2  # (C,)
     h = qb**2 - qa * qc[None, :]
     parallel = qa <= _EPS
@@ -150,21 +172,15 @@ def ray_capsules(xp: ModuleType, o: Array, d: Array, a: Array, b: Array, r: Arra
     return xp.min(t, axis=-1)
 
 
-def _yaw_rotations(xp: ModuleType, yaw: Array) -> Array:
-    """(B, 3, 3) rotation matrices about world z (box frame -> world)."""
-    c, s = xp.cos(yaw), xp.sin(yaw)
-    z, one = xp.zeros_like(yaw), xp.ones_like(yaw)
-    return xp.stack([xp.stack([c, -s, z], -1), xp.stack([s, c, z], -1), xp.stack([z, z, one], -1)], -2)
-
-
 def ray_boxes(xp: ModuleType, o: Array, d: Array, center: Array, half: Array, yaw: Array, active: Array) -> Array:
     """Nearest entry distance of unit rays (M, 3) into active yawed boxes (slab method); (M,), _NO_HIT if none."""
-    rot = _yaw_rotations(xp, yaw)  # (B, 3, 3)
-    o_box = xp.einsum("bji,bj->bi", rot, o[None, :] - center)  # R^T (o - c), (B, 3)
-    nb = rot.shape[0]
-    # d_box[m, b, i] = sum_j d[m, j] rot[b, j, i], as one (M, 3) x (3, B * 3) matmul.
-    d_box = xp.reshape(d @ xp.reshape(xp.transpose(rot, (1, 0, 2)), (3, nb * 3)), (d.shape[0], nb, 3))
-    d_safe = xp.where(xp.abs(d_box) < _DIR_EPS, xp.where(d_box >= 0.0, _DIR_EPS, -_DIR_EPS), d_box)
+    c, s = xp.cos(yaw), xp.sin(yaw)  # (B,); box frame = world frame yawed about z
+    rel = o[None, :] - center
+    o_box = xp.stack([c * rel[:, 0] + s * rel[:, 1], -s * rel[:, 0] + c * rel[:, 1], rel[:, 2]], axis=-1)  # (B, 3)
+    dx, dy = d[:, 0:1], d[:, 1:2]  # (M, 1)
+    d_box = xp.stack([c[None] * dx + s[None] * dy, -s[None] * dx + c[None] * dy,
+                      xp.broadcast_to(d[:, 2:3], (d.shape[0], yaw.shape[0]))], axis=-1)  # (M, B, 3)
+    d_safe = xp.copysign(xp.maximum(xp.abs(d_box), _DIR_EPS), d_box)  # keeps |d| >= eps and the input dtype
     t1 = (-half[None] - o_box[None]) / d_safe
     t2 = (half[None] - o_box[None]) / d_safe
     t_near = xp.max(xp.minimum(t1, t2), axis=-1)  # (M, B)
@@ -200,8 +216,10 @@ def capsule_distances(xp: ModuleType, p: Array, a: Array, b: Array, r: Array) ->
 
 def box_distances(xp: ModuleType, p: Array, center: Array, half: Array, yaw: Array) -> Array:
     """Signed distance of point p (3,) to each yawed box (negative inside); (B,)."""
-    rot = _yaw_rotations(xp, yaw)
-    q = xp.abs(xp.einsum("bji,bj->bi", rot, p[None, :] - center)) - half
+    c, s = xp.cos(yaw), xp.sin(yaw)
+    rel = p[None, :] - center
+    local = xp.stack([c * rel[:, 0] + s * rel[:, 1], -s * rel[:, 0] + c * rel[:, 1], rel[:, 2]], axis=-1)
+    q = xp.abs(local) - half
     outside = xp.sqrt(xp.sum(xp.maximum(q, 0.0) ** 2, axis=-1))
     return outside + xp.minimum(xp.max(q, axis=-1), 0.0)
 
@@ -370,8 +388,8 @@ def num_noise_uniforms(cfg: SonarConfig) -> int:
 def true_ranges(xp: ModuleType, qpos: Array, scene: NavScene, cfg: SonarConfig) -> tuple[Array, Array]:
     """Noise-free (fan (num_beams,), vertical (2,)) ranges, clipped to max_range_m."""
     rot = core.quat_to_mat(xp, qpos[3:7])
-    origin = qpos[:3] + rot @ xp.asarray(cfg.mount_pos_m, dtype=qpos.dtype)
-    dirs = xp.asarray(sonar_dirs_body(cfg), dtype=qpos.dtype) @ rot.T
+    origin = qpos[:3] + _mv(xp, rot, xp.asarray(cfg.mount_pos_m, dtype=qpos.dtype))
+    dirs = _pair_dot(xp, xp.asarray(sonar_dirs_body(cfg), dtype=qpos.dtype), rot)  # R d for every body ray
     t = xp.minimum(ray_scene(xp, origin, dirs, scene), cfg.max_range_m)
     n_fan = len(cfg.elevation_rows_rad) * cfg.num_beams
     fan = xp.min(xp.reshape(t[:n_fan], (len(cfg.elevation_rows_rad), cfg.num_beams)), axis=0)
@@ -397,17 +415,17 @@ def measure(
     noisy = ranges + sigma * noise_normal[: nb + 2]
     noisy = xp.where(noise_uniform < cfg.dropout_prob, cfg.max_range_m, noisy)
     noisy = xp.clip(noisy, 0.0, cfg.max_range_m)
-    vel_body = rot.T @ qvel[:3] + cfg.dvl_noise_std_mps * noise_normal[nb + 2 : nb + 5]
+    vel_body = _mtv(xp, rot, qvel[:3]) + cfg.dvl_noise_std_mps * noise_normal[nb + 2 : nb + 5]
     return NavMeasurement(
         sonar_range_m=noisy[:nb],
         altimeter_m=noisy[nb],
         up_range_m=noisy[nb + 1],
         vel_body_mps=vel_body,
         ang_vel_radps=qvel[3:6],
-        gravity_body=rot.T @ xp.asarray([0.0, 0.0, -1.0], dtype=qpos.dtype),
+        gravity_body=_mtv(xp, rot, xp.asarray([0.0, 0.0, -1.0], dtype=qpos.dtype)),
         yaw_rad=core.yaw_of(xp, rot),
         depth_m=surface_z_m - qpos[2],
-        goal_body_m=rot.T @ (scene.goal_m - qpos[:3]),
+        goal_body_m=_mtv(xp, rot, scene.goal_m - qpos[:3]),
     )
 
 
@@ -468,11 +486,11 @@ def velocity_wrench(xp: ModuleType, qpos: Array, qvel: Array, v_cmd_world: Array
     buoyancy feed-forward, yaw-rate P, roll / pitch PD); tests/test_nav_baseline.py checks the equivalence.
     """
     rot = core.quat_to_mat(xp, qpos[3:7])
-    v_cmd_body = rot.T @ v_cmd_world
-    v_err_body = v_cmd_body - rot.T @ qvel[:3]
+    v_cmd_body = _mtv(xp, rot, v_cmd_world)
+    v_err_body = v_cmd_body - _mtv(xp, rot, qvel[:3])
     drag_ff = vc.lin_damp * v_cmd_body + vc.quad_damp * xp.abs(v_cmd_body) * v_cmd_body
     force = vc.mass_kg * vc.kp_vel_ps * v_err_body + drag_ff
-    force = force + rot.T @ xp.asarray([0.0, 0.0, -vc.net_buoyancy_n], dtype=qpos.dtype)
+    force = force + _mtv(xp, rot, xp.asarray([0.0, 0.0, -vc.net_buoyancy_n], dtype=qpos.dtype))
     roll = xp.arctan2(rot[2, 1], rot[2, 2])
     pitch = -xp.arcsin(xp.clip(rot[2, 0], -1.0, 1.0))
     torque = xp.stack([
@@ -494,7 +512,7 @@ def command_to_thrust(xp: ModuleType, qpos: Array, qvel: Array, cmd: Array, cmd_
     yaw = core.yaw_of(xp, core.quat_to_mat(xp, qpos[3:7]))
     c, s = xp.cos(yaw), xp.sin(yaw)
     v_world = xp.stack([c * phys[0] - s * phys[1], s * phys[0] + c * phys[1], phys[2]])
-    thrust = vc.tam_pinv @ velocity_wrench(xp, qpos, qvel, v_world, phys[3], vc)
+    thrust = xp.sum(vc.tam_pinv * velocity_wrench(xp, qpos, qvel, v_world, phys[3], vc)[None, :], axis=-1)
     peak = xp.max(xp.abs(thrust))
     scale = xp.where(peak > vc.thrust_max_n, vc.thrust_max_n / xp.maximum(peak, _EPS), 1.0)
     return thrust * scale / vc.thrust_max_n

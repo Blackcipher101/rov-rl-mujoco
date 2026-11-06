@@ -180,3 +180,49 @@ def test_physics_model_has_no_obstacles():
     n_obs = int(np.sum(scene.cap_active) + np.sum(scene.box_active))
     assert scene_model.ngeom == base.ngeom + n_obs
     assert scene_model.opt.disableflags & mujoco.mjtDisableBit.mjDSBL_CONTACT
+
+
+def test_nav_core_uses_no_matmul():
+    """Regression (ws1 MJX parity failure): on GPUs JAX's default float32 matmul precision may use TF32, whose
+    ~1e-3 relative error turned grazing sonar misses into hits (MJX ranges up to 0.9 m short of the CPU env).
+    nav_core must therefore form every product elementwise; this guards against `@` / einsum creeping back."""
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(nav_core))
+    offenders = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.MatMult):
+            offenders.append(f"line {node.lineno}: @")
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in (
+                "einsum", "matmul", "dot", "tensordot", "inner", "vdot"):
+            offenders.append(f"line {node.lineno}: {node.func.attr}")
+    assert not offenders, offenders
+
+
+def test_sonar_rays_float32_match_float64():
+    """The ray quadratics are well conditioned in float32 (the MJX dtype): ranges agree with float64.
+
+    Origins and unit directions are built in float64 and cast, so only the ray-primitive arithmetic runs in
+    float32 (numpy 1.x promotes some scalar expressions in core.quat_to_mat, which JAX does not)."""
+    cfg = SonarConfig()
+    rng = np.random.default_rng(0)
+    worst, checked = 0.0, 0
+    for _ in range(8):
+        scene = nav_core.sample_scene(np, rng.random(nav_core.NAV_NUM_UNIFORMS), nav_eval_scene("high"))
+        scene32 = nav_core.NavScene(*[np.asarray(x, dtype=np.float32) for x in scene])
+        goal = np.asarray(scene.goal_m)
+        for _ in range(10):
+            o = np.append(rng.uniform(0.1, 0.9) * goal[:2] + rng.uniform(-4, 4, 2), rng.uniform(-1.0, 1.0))
+            if nav_core.clearance_m(np, o, scene) < 0.05:
+                continue
+            rot = core.quat_to_mat(np, core.yaw_quat(np, *rng.uniform(-0.1, 0.1, 2), rng.uniform(-np.pi, np.pi)))
+            d = nav_core.sonar_dirs_body(cfg) @ rot.T
+            t64 = np.minimum(nav_core.ray_scene(np, o, d, scene), cfg.max_range_m)
+            t32 = np.minimum(nav_core.ray_scene(np, o.astype(np.float32), d.astype(np.float32), scene32),
+                             np.float32(cfg.max_range_m))
+            assert t32.dtype == np.float32
+            worst = max(worst, float(np.max(np.abs(t32.astype(np.float64) - t64))))
+            checked += 1
+    assert checked > 40
+    assert worst < 2e-3, worst
