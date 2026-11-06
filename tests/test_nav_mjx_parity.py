@@ -26,6 +26,7 @@ from rov_rl.nav_mjx_env import NavMjxEnv  # noqa: E402
 STEPS = 150  # 6 s
 POS_TOL_M = 2e-3  # float32 MJX vs float64 CPU
 OBS_TOL = 5e-3
+MAX_EDGE_BEAMS = 2  # fan beams allowed to sit on a silhouette edge in the open-loop phase
 # Sensor noise comes from different generators (jax.random vs numpy), so parity is checked noise-free; the
 # noise model itself is shared code (nav_core.measure), tested on the CPU side.
 NOISELESS = dataclasses.replace(NavConfig(), sonar=dataclasses.replace(
@@ -35,6 +36,27 @@ SCENE = nav_eval_scene("high")
 
 def to_numpy(tree):
     return jax.tree_util.tree_map(lambda x: np.asarray(x, dtype=np.float64), tree)
+
+
+def check_open_loop_obs(obs_mjx: np.ndarray, obs_cpu: np.ndarray, qpos_mjx: np.ndarray,
+                        scene: nav_core.NavScene, step: int) -> None:
+    """Open-loop observation parity, tolerant of silhouette edges only.
+
+    After many open-loop steps the float32 and float64 states differ by up to POS_TOL_M. A fan ray grazing an
+    obstacle silhouette is discontinuous in the pose (it hits a near obstacle or the one behind it), so such a
+    beam may legitimately differ. Each differing element must be a fan beam (at most MAX_EDGE_BEAMS of them), and
+    the CPU ray code re-cast at the MJX pose must reproduce the MJX value: then the ray code agrees and only the
+    state drift differs. Every other element must match within OBS_TOL * 4.
+    """
+    sonar = NOISELESS.sonar
+    bad = np.flatnonzero(np.abs(obs_mjx - obs_cpu) > OBS_TOL * 4)
+    if bad.size == 0:
+        return
+    assert np.all(bad < sonar.num_beams) and bad.size <= MAX_EDGE_BEAMS, (
+        f"step {step}: obs elements {bad.tolist()} differ (mjx {obs_mjx[bad]}, cpu {obs_cpu[bad]})")
+    fan_at_mjx_pose, _ = nav_core.true_ranges(np, qpos_mjx, scene, sonar)
+    np.testing.assert_allclose(obs_mjx[bad], fan_at_mjx_pose[bad] / sonar.max_range_m, atol=OBS_TOL,
+                               err_msg=f"step {step}: beams {bad.tolist()} not explained by the pose difference")
 
 
 @pytest.mark.parametrize("seed", [0, 1, 2])
@@ -66,7 +88,8 @@ def test_nav_mjx_matches_cpu_open_loop(seed):
         np.testing.assert_allclose(np.asarray(state.data.qpos[:3]), cpu_env.data.qpos[:3], atol=POS_TOL_M,
                                    err_msg=f"position diverged at step {k}")
         assert float(state.reward) == pytest.approx(r_cpu, abs=5e-3)
-        np.testing.assert_allclose(np.asarray(state.obs), obs_cpu, atol=OBS_TOL * 4, err_msg=f"obs at step {k}")
+        check_open_loop_obs(np.asarray(state.obs, dtype=np.float64), obs_cpu, np.asarray(state.data.qpos, np.float64),
+                            params_np.scene, k)
         if done_cpu:
             break
 
