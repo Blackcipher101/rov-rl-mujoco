@@ -25,7 +25,7 @@ from rov_rl.mjx_env import RovMjxEnv
 from rov_rl.nav_cpu_env import make_velocity_controller_params
 from rov_rl.pid_baseline import PidGains
 
-NAV_METRIC_KEYS = ("progress", "clearance", "effort", "action_rate", "time", "tilt",
+NAV_METRIC_KEYS = ("progress", "clearance", "effort", "action_rate", "time", "tilt", "barrier", "proximity_speed",
                    "success", "collision", "failure", "thrust_impulse_ns")
 
 
@@ -53,15 +53,23 @@ class NavMjxEnv(RovMjxEnv):
     def action_size(self) -> int:
         return 4
 
-    def _observe(self, data: mjx.Data, scene: nav_core.NavScene, last_cmd: jax.Array,
-                 rng: jax.Array) -> jax.Array:
+    def _observe(self, data: mjx.Data, p: nav_core.NavEpisode, t_s: jax.Array, last_cmd: jax.Array,
+                 rng: jax.Array, memory: nav_core.FanMemory, dt_s: float) -> tuple[jax.Array, nav_core.FanMemory]:
+        """Sense at time t_s (moving obstacles at their positions then); dt_s since the last reading (0 at reset)."""
         sonar = self._nav_cfg.sonar
         k_n, k_u = jax.random.split(rng)
         normal = jax.random.normal(k_n, (nav_core.num_noise_normals(sonar),))
         uniform = jax.random.uniform(k_u, (nav_core.num_noise_uniforms(sonar),))
+        scene = nav_core.scene_at(jnp, p.scene, p.vehicle, t_s)
         meas = nav_core.measure(jnp, data.qpos, data.qvel, scene, sonar, self._scene_cfg.surface_z_m, normal,
                                 uniform)
-        return nav_core.nav_observation(jnp, meas, last_cmd, sonar, self._scene_cfg.surface_z_m)
+        polar = None
+        mem_cfg = self._nav_cfg.memory
+        if mem_cfg.enabled:  # static config: decided at trace time
+            memory = nav_core.memory_update(jnp, memory, meas, sonar, mem_cfg, dt_s)
+            polar = nav_core.memory_polar(jnp, memory, meas.yaw_rad, mem_cfg, self._sim.ctrl_dt_s)
+        obs = nav_core.nav_observation(jnp, meas, last_cmd, sonar, self._scene_cfg.surface_z_m, polar)
+        return obs, memory
 
     def reset(self, rng: jax.Array) -> mjx_env.State:
         k_v, k_s, k_obs, k_next = jax.random.split(rng, 4)
@@ -74,9 +82,11 @@ class NavMjxEnv(RovMjxEnv):
         qpos = data.qpos.at[:3].set(p.vehicle.start_pos_m).at[3:7].set(p.vehicle.start_quat)
         data = mjx.forward(model, data.replace(qpos=qpos))
         last_cmd = jnp.zeros(self.action_size)
-        obs = self._observe(data, p.scene, last_cmd, k_obs)
+        memory = nav_core.memory_init(jnp, self._nav_cfg.memory, self._nav_cfg.sonar, jnp.float32)
+        obs, memory = self._observe(data, p, t0, last_cmd, k_obs, memory, 0.0)
         dist = jnp.sqrt(jnp.sum((p.scene.goal_m - data.qpos[:3]) ** 2))
-        info: dict[str, Any] = {"params": p, "t_s": t0, "last_cmd": last_cmd, "dist_m": dist, "rng": k_next}
+        info: dict[str, Any] = {"params": p, "t_s": t0, "last_cmd": last_cmd, "dist_m": dist, "rng": k_next,
+                                "memory": memory}
         metrics = {k: jnp.zeros(()) for k in NAV_METRIC_KEYS}
         return mjx_env.State(data, obs, jnp.zeros(()), jnp.zeros(()), metrics, info)
 
@@ -98,14 +108,16 @@ class NavMjxEnv(RovMjxEnv):
         data, impulses = jax.lax.scan(substep, state.data, None, length=self._sim.n_substeps)
         finite = jnp.all(jnp.isfinite(data.qpos)) & jnp.all(jnp.isfinite(data.qvel))
         dist = jnp.sqrt(jnp.sum((p.scene.goal_m - data.qpos[:3]) ** 2))
-        clearance = nav_core.clearance_m(jnp, data.qpos[:3], p.scene)
+        t_next = t_s + self._sim.ctrl_dt_s
+        clearance = nav_core.clearance_m(jnp, data.qpos[:3], nav_core.scene_at(jnp, p.scene, p.vehicle, t_next))
+        speed = jnp.sqrt(jnp.sum(data.qvel[:3] ** 2))
         cos_tilt = core.quat_to_mat(jnp, data.qpos[3:7])[2, 2]
         reward, outcome, terms = nav_core.nav_reward_and_done(
-            jnp, state.info["dist_m"], dist, clearance, cos_tilt, thrust_action, cmd, state.info["last_cmd"],
+            jnp, state.info["dist_m"], dist, clearance, speed, cos_tilt, thrust_action, cmd, state.info["last_cmd"],
             finite, self._nav_cfg.reward)
         k_obs, k_next = jax.random.split(state.info["rng"])
-        obs = self._observe(data, p.scene, cmd, k_obs)
-        info = {**state.info, "t_s": t_s + self._sim.ctrl_dt_s, "last_cmd": cmd, "dist_m": dist, "rng": k_next}
+        obs, memory = self._observe(data, p, t_next, cmd, k_obs, state.info["memory"], self._sim.ctrl_dt_s)
+        info = {**state.info, "t_s": t_next, "last_cmd": cmd, "dist_m": dist, "rng": k_next, "memory": memory}
         # Start from the incoming metrics: brax wrappers add keys (e.g. 'reward' in EvalWrapper) and
         # jax.lax.scan needs the same pytree structure on every step.
         metrics = {

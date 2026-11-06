@@ -4,6 +4,7 @@
 # Usage:  scripts/run_ws1.sh [smoke|full|all|nav_smoke|nav_full|nav]
 #           smoke / full / all (default: all = smoke, then full): station keeping + tracking (control task)
 #           nav_smoke / nav_full / nav (= nav_smoke, then nav_full): sonar obstacle avoidance, RL vs VFH+
+#           nav2_smoke / nav2_full / nav2: fan memory, safety shaping, moving obstacles, staged curriculum
 # Env:    MJRL_VENV  (default: $HOME/.venvs/mjrl)  venv with jax[cuda12], mujoco,
 #                    mujoco-mjx, playground, brax, imageio, imageio-ffmpeg, pytest (+ matplotlib for nav plots)
 #         RUNS_DIR   (default: <repo>/runs)
@@ -22,8 +23,8 @@ STAGE="${1:-all}"
 PY="$VENV/bin/python"
 
 case "$STAGE" in
-  smoke|full|all|nav_smoke|nav_full|nav) ;;
-  *) echo "usage: $0 [smoke|full|all|nav_smoke|nav_full|nav]" >&2; exit 2 ;;
+  smoke|full|all|nav_smoke|nav_full|nav|nav2_smoke|nav2_full|nav2) ;;
+  *) echo "usage: $0 [smoke|full|all|nav_smoke|nav_full|nav|nav2_smoke|nav2_full|nav2]" >&2; exit 2 ;;
 esac
 if [[ ! -x "$PY" ]]; then
   echo "error: no python at $PY (set MJRL_VENV)" >&2
@@ -100,6 +101,31 @@ run_nav_full() {
   banner "nav_full: results table -> $out/nav_eval/results.md"
 }
 
+# nav2: same eval seeds and VFH+ baseline as nav (static cells are directly comparable), plus moving-obstacle
+# cells and the VFH+ variant with log-odds decay (config/nav_baseline_decay.json).
+run_nav2_smoke() {
+  local out="$RUNS_DIR/nav2_smoke"
+  mkdir -p "$out"
+  banner "nav2_smoke: train (3-stage curriculum)"
+  "$PY" -u train.py --task nav2 --preset smoke --out-dir "$out" 2>&1 | tee "$out/train.log"
+  banner "nav2_smoke: eval (RL vs VFH+, static + moving)"
+  JAX_PLATFORMS=cpu "$PY" -u eval_nav.py --task nav2 --controllers baseline,baseline_decay,rl \
+    --policy-dir "$out/policy" --movers static,moving --episodes 2 --densities low,high --current-levels 0,2 \
+    --video-cells high_L2_mov --plot-cell high_L2_mov --out-dir "$out/nav_eval" 2>&1 | tee "$out/nav_eval.log"
+}
+
+run_nav2_full() {
+  local out="$RUNS_DIR/nav2_full"
+  mkdir -p "$out"
+  banner "nav2_full: train (3-stage curriculum)"
+  "$PY" -u train.py --task nav2 --preset full --out-dir "$out" 2>&1 | tee "$out/train.log"
+  banner "nav2_full: eval (RL vs VFH+, static + moving)"
+  JAX_PLATFORMS=cpu "$PY" -u eval_nav.py --task nav2 --controllers baseline,baseline_decay,rl \
+    --policy-dir "$out/policy" --movers static,moving --episodes "$EVAL_EPISODES" \
+    --video-cells high_L2,high_L2_mov --plot-cell high_L2_mov --out-dir "$out/nav_eval" 2>&1 | tee "$out/nav_eval.log"
+  banner "nav2_full: results table -> $out/nav_eval/results.md"
+}
+
 case "$STAGE" in
   smoke) run_smoke ;;
   full) run_full ;;
@@ -107,5 +133,8 @@ case "$STAGE" in
   nav_smoke) run_nav_smoke ;;
   nav_full) run_nav_full ;;
   nav) run_nav_smoke; run_nav_full ;;
+  nav2_smoke) run_nav2_smoke ;;
+  nav2_full) run_nav2_full ;;
+  nav2) run_nav2_smoke; run_nav2_full ;;
 esac
 banner "done ($STAGE)"

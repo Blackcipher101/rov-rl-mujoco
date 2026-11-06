@@ -34,7 +34,7 @@ import pathlib
 import numpy as np
 
 from rov_rl import nav_core
-from rov_rl.config import NavCommandConfig, SonarConfig
+from rov_rl.config import NavCommandConfig, SimConfig, SonarConfig
 
 DEFAULT_VFH_PATH = pathlib.Path(__file__).resolve().parents[1] / "config" / "nav_baseline.json"
 
@@ -51,6 +51,10 @@ class VfhParams:
     occupied_logodds: float = 0.5
     free_margin_m: float = 0.3  # free-space clearing stops this far short of an echo
     seabed_gate_frac: float = 0.9
+    # Optional forgetting for moving obstacles: every control step all log-odds relax towards 0 (unknown) by the
+    # factor exp(-logodds_decay_per_s * dt). 0 = off (the static-scene baseline). It also forgets static obstacles
+    # that left the fan, so it is tuned separately (scripts/tune_nav_baseline.py --decay-only).
+    logodds_decay_per_s: float = 0.0
     # Polar histogram.
     num_sectors: int = 72
     window_radius_m: float = 6.0
@@ -109,6 +113,8 @@ class VfhParams:
             raise ValueError("hist_low must be <= hist_high")
         if not self.logodds_min < self.occupied_logodds < self.logodds_max:
             raise ValueError("occupied_logodds must lie inside (logodds_min, logodds_max)")
+        if self.logodds_decay_per_s < 0.0:
+            raise ValueError("logodds_decay_per_s must be >= 0")
         if self.slow_range_m <= self.stop_range_m:
             raise ValueError("slow_range_m must exceed stop_range_m")
 
@@ -155,9 +161,12 @@ class OccupancyGrid:
         return (np.stack([i, j], axis=-1) + 0.5) * self.p.cell_m - self.p.grid_half_extent_m
 
     def update(self, origin_xy: np.ndarray, dirs_xy: np.ndarray, ranges_m: np.ndarray, is_echo: np.ndarray,
-               max_range_m: float) -> None:
-        """Clear cells along each beam (up to the echo minus a margin, or to max range) and mark echo cells."""
+               max_range_m: float, dt_s: float = 0.0) -> None:
+        """Decay all cells over dt_s (if enabled), clear cells along each beam (up to the echo minus a margin, or to
+        max range) and mark echo cells."""
         p = self.p
+        if p.logodds_decay_per_s > 0.0 and dt_s > 0.0:
+            self.logodds *= math.exp(-p.logodds_decay_per_s * dt_s)
         steps = np.arange(0.0, max_range_m, 0.5 * p.cell_m)
         free_len = np.where(is_echo, ranges_m - p.free_margin_m, ranges_m)
         pts = origin_xy[None, None, :] + steps[None, :, None] * dirs_xy[:, None, :]
@@ -187,9 +196,11 @@ class OccupancyGrid:
 class VfhPlanner:
     """VFH+ local planner; act(meas) -> normalized velocity command (4,)."""
 
-    def __init__(self, params: VfhParams, sonar: SonarConfig, command: NavCommandConfig) -> None:
+    def __init__(self, params: VfhParams, sonar: SonarConfig, command: NavCommandConfig,
+                 ctrl_dt_s: float = SimConfig().ctrl_dt_s) -> None:
         params.validate()
         self.p = params
+        self.ctrl_dt_s = ctrl_dt_s
         self.sonar = sonar
         self.command = command
         self.grid = OccupancyGrid(params)
@@ -226,7 +237,7 @@ class VfhPlanner:
         d = self._fan_dirs_body @ rot.T
         dxy = d[:, :2] / np.maximum(np.linalg.norm(d[:, :2], axis=-1, keepdims=True), 1e-9)
         self.grid.update(origin[:2], dxy, np.asarray(meas.sonar_range_m, dtype=float), self.echo_mask(meas),
-                         self.sonar.max_range_m)
+                         self.sonar.max_range_m, self.ctrl_dt_s)
         return rot, pos
 
     # --- VFH+ ----------------------------------------------------------------------------------------------

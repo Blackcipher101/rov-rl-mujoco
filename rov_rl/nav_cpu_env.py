@@ -117,10 +117,16 @@ class NavCpuEnv:
         self._last_cmd = np.zeros(4)
         self._dist_m = 0.0
         self._noise_rng = np.random.default_rng(0)
+        self.memory: nav_core.FanMemory | None = None
 
     @property
     def observation_size(self) -> int:
-        return nav_core.nav_obs_size(self.cfg.sonar)
+        return nav_core.nav_obs_size(self.cfg.sonar, self.cfg.memory)
+
+    def scene_now(self) -> nav_core.NavScene:
+        """Obstacle field at the current time (moving obstacles at their current positions)."""
+        self._require_reset()
+        return nav_core.scene_at(np, self.params.scene, self.params.vehicle, np.float64(self.t_s))
 
     def sample_params(self, rng: np.random.Generator) -> nav_core.NavEpisode:
         return nav_core.make_episode(np, rng.random(core.NUM_UNIFORMS), rng.random(nav_core.NAV_NUM_UNIFORMS),
@@ -144,15 +150,23 @@ class NavCpuEnv:
         self.step_count = 0
         self._last_cmd = np.zeros(4)
         self._dist_m = float(np.linalg.norm(params.scene.goal_m - self.data.qpos[:3]))
-        return self._observe()
+        self.memory = nav_core.memory_init(np, self.cfg.memory, self.cfg.sonar, np.float64)
+        return self._observe(dt_s=0.0)
 
-    def _observe(self) -> np.ndarray:
+    def _observe(self, dt_s: float) -> np.ndarray:
+        """Sense at the current time; dt_s is the time since the previous reading (0 at reset)."""
         sonar = self.cfg.sonar
         normal = self._noise_rng.standard_normal(nav_core.num_noise_normals(sonar))
         uniform = self._noise_rng.random(nav_core.num_noise_uniforms(sonar))
-        self.measurement = nav_core.measure(np, self.data.qpos, self.data.qvel, self.params.scene, sonar,
+        self.measurement = nav_core.measure(np, self.data.qpos, self.data.qvel, self.scene_now(), sonar,
                                             self.scene_cfg.surface_z_m, normal, uniform)
-        return nav_core.nav_observation(np, self.measurement, self._last_cmd, sonar, self.scene_cfg.surface_z_m)
+        polar = None
+        if self.cfg.memory.enabled:
+            self.memory = nav_core.memory_update(np, self.memory, self.measurement, sonar, self.cfg.memory, dt_s)
+            polar = nav_core.memory_polar(np, self.memory, self.measurement.yaw_rad, self.cfg.memory,
+                                          self.cfg.sim.ctrl_dt_s)
+        return nav_core.nav_observation(np, self.measurement, self._last_cmd, sonar, self.scene_cfg.surface_z_m,
+                                        polar)
 
     def _require_reset(self) -> None:
         if self.params is None:
@@ -160,7 +174,7 @@ class NavCpuEnv:
 
     def clearance_m(self) -> float:
         self._require_reset()
-        return float(nav_core.clearance_m(np, self.data.qpos[:3], self.params.scene))
+        return float(nav_core.clearance_m(np, self.data.qpos[:3], self.scene_now()))
 
     def step(self, cmd: np.ndarray) -> tuple[np.ndarray, float, bool, NavStepInfo]:
         self._require_reset()
@@ -180,14 +194,15 @@ class NavCpuEnv:
         qpos = self.data.qpos
         finite = bool(np.all(np.isfinite(qpos)) and np.all(np.isfinite(self.data.qvel)))
         dist = float(np.linalg.norm(p.scene.goal_m - qpos[:3]))
-        clearance = float(nav_core.clearance_m(np, qpos[:3], p.scene))
+        clearance = float(nav_core.clearance_m(np, qpos[:3], self.scene_now()))
+        speed = np.sqrt(np.sum(self.data.qvel[:3] ** 2))
         cos_tilt = core.quat_to_mat(np, qpos[3:7])[2, 2]
         reward, outcome, terms = nav_core.nav_reward_and_done(
-            np, np.float64(self._dist_m), np.float64(dist), np.float64(clearance), cos_tilt, thrust_action, cmd,
-            self._last_cmd, np.bool_(finite), self.cfg.reward)
+            np, np.float64(self._dist_m), np.float64(dist), np.float64(clearance), speed, cos_tilt, thrust_action,
+            cmd, self._last_cmd, np.bool_(finite), self.cfg.reward)
         self._dist_m = dist
         self._last_cmd = cmd
-        obs = self._observe()
+        obs = self._observe(dt_s=self.cfg.sim.ctrl_dt_s)
         terminated = bool(outcome.done)
         timeout = (not terminated) and self.step_count >= self.cfg.sim.episode_steps
         info = NavStepInfo(

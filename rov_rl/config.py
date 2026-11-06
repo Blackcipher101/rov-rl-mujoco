@@ -209,6 +209,19 @@ class NavSceneConfig:
     slot_density: tuple[float, float] = (0.1, 0.65)
     pipe_prob: tuple[float, float] = (0.0, 0.75)
     keepout_m: float = 1.5
+    # Moving obstacles (other vehicles / drifting objects): short vertical capsules near the vehicle's depth.
+    # Each of the `num_movers` slots is active with probability `mover_prob`; an active mover either patrols a
+    # smooth 2D Lissajous loop around a centre in the middle of the field (peak speed per axis
+    # `mover_speed_mps`, at most ~1.4x that combined) or, with probability `p_mover_drift`, drifts with the water
+    # current. Movers may pass through static obstacles (no interaction is modelled).
+    num_movers: int = 3
+    mover_prob: float = 0.0
+    p_mover_drift: float = 0.25
+    mover_radius_m: tuple[float, float] = (0.3, 0.6)
+    mover_half_height_m: tuple[float, float] = (0.3, 0.6)
+    mover_amplitude_m: tuple[float, float] = (1.0, 4.0)
+    mover_speed_mps: tuple[float, float] = (0.1, 0.3)
+    mover_dz_m: float = 1.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -234,6 +247,30 @@ class NavRewardConfig:
     w_tilt: float = 0.5
     goal_radius_m: float = 1.0
     min_cos_tilt: float = 0.5
+    # nav2 safety shaping (0 = off, as in the nav task): barrier = -w_barrier * (1 - clearance / d)^2 below
+    # d = barrier_clearance_m; proximity speed = -w_proximity_speed * (1 - clearance / d) * speed / surge limit.
+    w_barrier: float = 0.0
+    barrier_clearance_m: float = 0.8
+    w_proximity_speed: float = 0.0
+    proximity_speed_norm_mps: float = 0.6  # = NavCommandConfig.surge_max_mps
+
+
+@dataclasses.dataclass(frozen=True)
+class MemoryConfig:
+    """Egocentric short-term obstacle memory built from past sonar fans (nav2; disabled in the nav task).
+
+    Every `stride_steps` control steps the fan's echo points (range < `max_range_m`) are stored in one of `slots`
+    ring-buffer slots as horizontal offsets from the vehicle (world axes). Every step all stored points are moved by
+    the measured displacement (DVL velocity rotated by the measured attitude). Points older than the horizon
+    (slots * stride_steps control steps) expire. The policy sees the nearest remembered point per 360 deg sector
+    around the current heading (`sectors` values, range / max_range_m, 1 = nothing remembered).
+    """
+
+    enabled: bool = False
+    slots: int = 12
+    stride_steps: int = 10  # 0.4 s at 25 Hz: horizon 12 * 0.4 = 4.8 s
+    max_range_m: float = 6.0  # also keeps seabed returns (>= ~7 m at >= 1.2 m altitude) out of the memory
+    sectors: int = 24
 
 
 @dataclasses.dataclass(frozen=True)
@@ -242,6 +279,7 @@ class NavConfig:
     sonar: SonarConfig = SonarConfig()
     command: NavCommandConfig = NavCommandConfig()
     reward: NavRewardConfig = NavRewardConfig()
+    memory: MemoryConfig = MemoryConfig()
 
 
 # Vehicle / current randomization for nav training: the plant ranges of TRAIN_RANDOMIZATION, a weaker current
@@ -274,3 +312,46 @@ def nav_eval_scene(density: str) -> NavSceneConfig:
         raise ValueError(f"unknown density '{density}', expected one of {sorted(NAV_DENSITY_LEVELS)}")
     slot, pipe = NAV_DENSITY_LEVELS[density]
     return dataclasses.replace(NAV_TRAIN_SCENE, slot_density=(slot, slot), pipe_prob=(pipe, pipe))
+
+
+# --------------------------------------------------------------------------------------------------------------
+# nav2: the nav task with fan memory, safety shaping, moving obstacles and a staged curriculum (train.py --task nav2)
+# --------------------------------------------------------------------------------------------------------------
+
+NAV2_CONFIG = NavConfig(
+    memory=MemoryConfig(enabled=True),
+    reward=NavRewardConfig(w_barrier=0.2, barrier_clearance_m=0.8, w_proximity_speed=0.05),
+)
+# Evaluation "moving" scenario: each of the 3 mover slots is active with this probability.
+NAV_MOVING_MOVER_PROB = 0.8
+
+
+@dataclasses.dataclass(frozen=True)
+class CurriculumStage:
+    name: str
+    fraction: float  # of the total training steps
+    vehicle: RandomizationConfig
+    scene: NavSceneConfig
+
+
+def _nav2_vehicle(current_max_mps: float, amp_max_mps: float) -> RandomizationConfig:
+    return dataclasses.replace(NAV_TRAIN_VEHICLE, current_const_mps=(0.0, current_max_mps),
+                               current_amp_mps=(0.0, amp_max_mps))
+
+
+# Easy -> hard. Stage 3 covers every evaluation cell's density and current (incl. level 3 = 0.3 m/s, outside the
+# nav training range) and moving obstacles; stage 2 introduces movers.
+NAV2_CURRICULUM: tuple[CurriculumStage, ...] = (
+    CurriculumStage("sparse_calm", 0.2, _nav2_vehicle(0.08, 0.03),
+                    dataclasses.replace(NAV_TRAIN_SCENE, slot_density=(0.05, 0.3), pipe_prob=(0.0, 0.3))),
+    CurriculumStage("medium_movers", 0.3, _nav2_vehicle(0.2, 0.06),
+                    dataclasses.replace(NAV_TRAIN_SCENE, slot_density=(0.1, 0.5), pipe_prob=(0.0, 0.6),
+                                        mover_prob=0.3)),
+    CurriculumStage("full", 0.5, _nav2_vehicle(0.32, 0.1),
+                    dataclasses.replace(NAV_TRAIN_SCENE, slot_density=(0.1, 0.7), pipe_prob=(0.0, 0.8),
+                                        mover_prob=0.6)),
+)
+
+
+def nav_eval_scene_moving(density: str) -> NavSceneConfig:
+    return dataclasses.replace(nav_eval_scene(density), mover_prob=NAV_MOVING_MOVER_PROB)

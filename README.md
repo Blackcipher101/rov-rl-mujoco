@@ -495,3 +495,68 @@ None of these has been run yet.
   dynamics.
 * **Simplified scene:** pipe spans float without supports, and obstacles may overlap one another (rock
   piles); only the start and goal keep-out is enforced.
+
+## nav2: fan memory, safety shaping, moving obstacles, curriculum
+
+The first nav policy was faster and more direct than VFH+, but it collided in 22 % of episodes, against 0 %
+for VFH+. The mean minimum clearance was 0.37 m against 0.98 m. Most collisions came in dense fields with
+current. nav2 tries to close that gap while keeping most of the speed. It also adds moving obstacles.
+`train.py --task nav2` / `eval_nav.py --task nav2`; the nav task, its presets and its results are unchanged.
+
+### Changes
+
+* **Short-term obstacle memory** (`config.MemoryConfig`, `nav_core.memory_update` / `memory_polar`).
+  * **How it works:** every 0.4 s, the fan's echo points within 6 m are stored in a 12-slot ring buffer as
+    horizontal offsets from the vehicle. Every step the stored points are moved by the measured displacement:
+    DVL velocity rotated by the measured attitude and compass. Points expire after 4.8 s.
+  * **What the policy sees:** 24 extra observation values, the nearest remembered point per 15 deg sector over
+    the full 360 deg around the current heading (94 values in total).
+  * **Why not a frame stack:** stacking the last K = 4 fans covers only 0.16 s and nothing outside the 120 deg
+    fan. The collisions happen next to and behind the vehicle while it rounds an obstacle, and that is what the
+    memory covers.
+  * **No privileged information:** only measured quantities are used, and no obstacle velocities.
+  * **Parity:** the update is elementwise like the rest of `nav_core`, so CPU and MJX produce the same
+    observation.
+* **Safety shaping** (`NAV2_CONFIG.reward`):
+  * a barrier -0.2 x (1 - clearance / 0.8 m)^2. At 0.4 m it costs more per step than cruising earns in
+    progress.
+  * a proximity speed penalty -0.05 x (1 - clearance / 0.8 m) x speed / 0.6 m/s.
+  * Collision termination and the -50 penalty are unchanged.
+* **Moving obstacles** (`NavSceneConfig.num_movers` = 3 slots, `mover_prob`).
+  * **Shape and motion:** vertical capsules (r 0.3-0.6 m, 0.6-1.2 m tall) near the vehicle's depth. They
+    either patrol smooth 2D Lissajous loops (amplitude 1-4 m, per-axis peak speed 0.1-0.3 m/s, at most about
+    0.42 m/s combined) or, with probability 0.25, drift with the water current (closed-form integral of the
+    current model).
+  * **Same code path:** rays, clearance and collision use the obstacle poses at the current time through
+    `nav_core.scene_at`, in both envs.
+  * **Keep-out:** patrol loops keep clear of the start and goal at all times. Drifters are checked only at
+    t = 0.
+  * **No interaction:** movers may pass through static obstacles.
+  * **Seeds:** static fields keep their seeds, because mover uniforms are drawn after the static ones.
+* **Curriculum** (`config.NAV2_CURRICULUM`): three stages run inside one `train.py` call. Each stage is a
+  `ppo.train` call that continues from the previous stage's normaliser, policy and value parameters (brax
+  `restore_params`); the optimiser state restarts.
+  * 20 %: sparse fields (occupancy 0.05-0.3), current up to 0.08 m/s, no movers.
+  * 30 %: occupancy up to 0.5, current up to 0.2 m/s, movers active with probability 0.3.
+  * 50 %: occupancy up to 0.7, current up to 0.32 m/s (covers eval level 3), movers with probability 0.6.
+  * The env's `reset()` cannot see the global step count, because the playground auto-reset wrapper re-creates
+    the info dict. That is why the curriculum is staged rather than scheduled inside the env.
+* **Training:** PPO as for nav (gamma 0.995), 600 M steps in the full preset.
+* **Baselines:**
+  * `baseline` is the unchanged VFH+ (`config/nav_baseline.json`), so static cells compare directly with the
+    nav results.
+  * `baseline_decay` adds one option: all grid log-odds relax towards "unknown" with rate
+    `logodds_decay_per_s`, so cells vacated by a moving obstacle are freed. The rate was chosen by
+    `scripts/tune_nav_baseline.py --decay-only` on the tuning seed (static and moving tuning episodes), with
+    all other parameters unchanged (`config/nav_baseline_decay.json`).
+* **Evaluation:** `eval_nav.py --movers static,moving`.
+  * Static cells keep their names and seeds.
+  * Moving cells (`*_mov`, 3 mover slots active with probability 0.8) use an extra seed component.
+  * All controllers run the same episodes.
+  * Videos draw the movers as orange capsules with trails; the overhead plot draws their dashed paths.
+
+### nav2 status
+
+* **Run on the laptop:** CPU tests, decay tuning and baseline-only smoke runs.
+* **Not run yet:** nav2 training and its RL evaluation, the nav2 MJX parity cases, and video encoding.
+* **No nav2 RL results yet.**

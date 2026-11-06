@@ -26,6 +26,7 @@ import numpy as np
 
 from rov_rl import core
 from rov_rl.config import (
+    MemoryConfig,
     NavCommandConfig,
     NavRewardConfig,
     NavSceneConfig,
@@ -39,7 +40,7 @@ Array = Any  # numpy.ndarray or jax.Array
 # Half the diagonal of the published 0.46 x 0.58 x 0.38 m envelope ([vB22] Table 5): a sphere that contains
 # the whole vehicle, so a collision is never missed (slightly conservative at the corners).
 VEHICLE_BOUNDING_RADIUS_M = 0.5 * math.sqrt(0.46**2 + 0.58**2 + 0.38**2)
-NAV_NUM_UNIFORMS = 256
+NAV_NUM_UNIFORMS = 320  # static fields use the first 236; movers are drawn after them
 PILLAR_BURY_M = 1.0  # pillars start this far below the seabed so the seabed joint has no gap
 _EPS = 1e-9
 _DIR_EPS = 1e-12
@@ -62,6 +63,16 @@ class NavScene(NamedTuple):
     box_half_m: Array  # (B, 3) half sizes in the box frame
     box_yaw_rad: Array  # (B,)
     box_active: Array  # (B,)
+    # Moving obstacles: vertical capsules whose centre follows mover_positions(); inactive slots are ignored.
+    mov_center_m: Array  # (M, 3) patrol centre / drift start
+    mov_axis1_m: Array  # (M, 3) Lissajous amplitude vectors (horizontal)
+    mov_axis2_m: Array  # (M, 3)
+    mov_omega_radps: Array  # (M, 2)
+    mov_phase_rad: Array  # (M, 2)
+    mov_radius_m: Array  # (M,)
+    mov_half_height_m: Array  # (M,) half length of the capsule segment
+    mov_drift: Array  # (M,) 1.0: drifts with the water current instead of patrolling
+    mov_active: Array  # (M,)
 
 
 class NavEpisode(NamedTuple):
@@ -318,6 +329,33 @@ def sample_scene(xp: ModuleType, u: Array, cfg: NavSceneConfig) -> NavScene:
     box_ok = ((box_distances(xp, start, box_center, box_half, box_yaw) >= min_gap)
               & (box_distances(xp, goal, box_center, box_half, box_yaw) >= min_gap)).astype(dt)
 
+    # Moving obstacles (drawn after everything above, so static fields keep their seeds).
+    m = cfg.num_movers
+    mov_active = (c.take(m) < cfg.mover_prob).astype(dt)
+    mov_drift = (c.take(m) < cfg.p_mover_drift).astype(dt)
+    mov_r = _lerp(c.take(m), cfg.mover_radius_m)
+    mov_hh = _lerp(c.take(m), cfg.mover_half_height_m)
+    mov_s = dist * _lerp(c.take(m), (0.3, 0.7))
+    mov_q = _sym(c.take(m), 0.5 * cfg.corridor_half_width_m)
+    mov_z = xp.maximum(goal_dz * mov_s / dist + _sym(c.take(m), cfg.mover_dz_m), seabed_z + mov_hh + mov_r + 0.2)
+    amp1 = _lerp(c.take(m), cfg.mover_amplitude_m)
+    amp2 = _lerp(c.take(m), cfg.mover_amplitude_m)
+    speed = _lerp(c.take(m), cfg.mover_speed_mps)
+    ratio = _lerp(c.take(m), (0.5, 1.0))
+    theta = math.pi * c.take(m)
+    phase = 2.0 * math.pi * xp.stack([c.take(m), c.take(m)], axis=-1)
+    zm = xp.zeros_like(theta)
+    mov_center = (mov_s[:, None] * along[None, :] + mov_q[:, None] * cross[None, :]
+                  + mov_z[:, None] * xp.asarray([0.0, 0.0, 1.0], dtype=dt)[None, :])
+    axis1 = amp1[:, None] * xp.stack([xp.cos(theta), xp.sin(theta), zm], axis=-1)
+    axis2 = amp2[:, None] * xp.stack([-xp.sin(theta), xp.cos(theta), zm], axis=-1)
+    omega = xp.stack([speed / amp1, speed * ratio / amp2], axis=-1)  # peak speed per axis = speed (* ratio)
+    # Keep-out: patrol loops must stay clear of start and goal for all t (bounding sphere of the loop); drifters
+    # are checked at their start position only (see README).
+    reach = (1.0 - mov_drift) * (amp1 + amp2) + mov_r + mov_hh
+    mov_ok = ((xp.sqrt(xp.sum((mov_center - start[None]) ** 2, axis=-1)) - reach >= min_gap)
+              & (xp.sqrt(xp.sum((mov_center - goal[None]) ** 2, axis=-1)) - reach >= min_gap)).astype(dt)
+
     return NavScene(
         goal_m=goal,
         start_yaw_rad=start_yaw,
@@ -332,6 +370,44 @@ def sample_scene(xp: ModuleType, u: Array, cfg: NavSceneConfig) -> NavScene:
         box_half_m=box_half,
         box_yaw_rad=box_yaw,
         box_active=box_active * box_ok,
+        mov_center_m=mov_center,
+        mov_axis1_m=axis1,
+        mov_axis2_m=axis2,
+        mov_omega_radps=omega,
+        mov_phase_rad=phase,
+        mov_radius_m=mov_r,
+        mov_half_height_m=mov_hh,
+        mov_drift=mov_drift,
+        mov_active=mov_active * mov_ok,
+    )
+
+
+def current_displacement(xp: ModuleType, t_s: Array, p: core.EpisodeParams) -> Array:
+    """Integral of core.current_velocity from 0 to t [m] (closed form): where drifting objects are carried."""
+    w = 2.0 * math.pi * p.current_freq_hz
+    return p.current_const_mps * t_s + p.current_amp_mps / w * (xp.cos(p.current_phase_rad)
+                                                                - xp.cos(w * t_s + p.current_phase_rad))
+
+
+def mover_positions(xp: ModuleType, scene: NavScene, vehicle: core.EpisodeParams, t_s: Array) -> Array:
+    """Mover centres at time t (M, 3): Lissajous patrol, or drift with the water current."""
+    ang = scene.mov_omega_radps * t_s + scene.mov_phase_rad  # (M, 2)
+    patrol = (scene.mov_center_m + scene.mov_axis1_m * xp.sin(ang[:, 0:1])
+              + scene.mov_axis2_m * xp.sin(ang[:, 1:2]))
+    drift = scene.mov_center_m + current_displacement(xp, t_s, vehicle)[None, :]
+    return xp.where(scene.mov_drift[:, None] > 0.5, drift, patrol)
+
+
+def scene_at(xp: ModuleType, scene: NavScene, vehicle: core.EpisodeParams, t_s: Array) -> NavScene:
+    """The obstacle field at time t: movers appended to the capsule set (rays / clearance then need no changes)."""
+    pos = mover_positions(xp, scene, vehicle, t_s)
+    up = scene.mov_half_height_m[:, None] * xp.asarray([0.0, 0.0, 1.0], dtype=pos.dtype)[None, :]
+    return scene._replace(
+        cap_a_m=xp.concatenate([scene.cap_a_m, pos - up], axis=0),
+        cap_b_m=xp.concatenate([scene.cap_b_m, pos + up], axis=0),
+        cap_radius_m=xp.concatenate([scene.cap_radius_m, scene.mov_radius_m]),
+        cap_active=xp.concatenate([scene.cap_active, scene.mov_active]),
+        cap_is_pipe=xp.concatenate([scene.cap_is_pipe, xp.zeros_like(scene.mov_radius_m)]),
     )
 
 
@@ -432,13 +508,14 @@ def measure(
 GOAL_DISTANCE_SCALE_M = 30.0  # observation scaling only
 
 
-def nav_obs_size(cfg: SonarConfig) -> int:
-    return cfg.num_beams + 22
+def nav_obs_size(cfg: SonarConfig, memory: MemoryConfig = MemoryConfig()) -> int:
+    return cfg.num_beams + 22 + (memory.sectors if memory.enabled else 0)
 
 
 def nav_observation(xp: ModuleType, meas: NavMeasurement, last_cmd: Array, cfg: SonarConfig,
-                    surface_z_m: float) -> Array:
-    """Policy observation (nav_obs_size,): a fixed encoding of NavMeasurement plus the previous command."""
+                    surface_z_m: float, memory_polar: Array | None = None) -> Array:
+    """Policy observation (nav_obs_size,): a fixed encoding of NavMeasurement plus the previous command, and the
+    fan memory's polar map (memory_polar, nav2) when given."""
     g = meas.goal_body_m
     g_norm = xp.sqrt(xp.sum(g**2))
     obs = xp.concatenate([
@@ -451,8 +528,94 @@ def nav_observation(xp: ModuleType, meas: NavMeasurement, last_cmd: Array, cfg: 
         g / xp.maximum(g_norm, 1.0),  # 3 goal direction, shrinking inside 1 m
         xp.stack([xp.minimum(g_norm, GOAL_DISTANCE_SCALE_M) / GOAL_DISTANCE_SCALE_M]),  # 1
         last_cmd,  # 4
-    ])
+    ] + ([] if memory_polar is None else [memory_polar]))  # memory.sectors
     return xp.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+# --- fan memory (nav2) -------------------------------------------------------------------------------------
+
+
+class FanMemory(NamedTuple):
+    """Ring buffer of past fan echo points (see config.MemoryConfig); a pytree for JAX."""
+
+    points_m: Array  # (slots, num_beams, 2) horizontal offsets from the vehicle centre, world axes
+    valid: Array  # (slots, num_beams) 1.0 for a stored echo
+    age_s: Array  # (slots,)
+    count: Array  # number of updates so far (float)
+
+
+MEMORY_EMPTY_AGE_S = 1e6
+
+
+def memory_horizon_s(mem_cfg: MemoryConfig, ctrl_dt_s: float) -> float:
+    return mem_cfg.slots * mem_cfg.stride_steps * ctrl_dt_s
+
+
+def memory_init(xp: ModuleType, mem_cfg: MemoryConfig, sonar: SonarConfig, dtype: Any) -> FanMemory:
+    k, nb = mem_cfg.slots, sonar.num_beams
+    return FanMemory(xp.zeros((k, nb, 2), dtype=dtype), xp.zeros((k, nb), dtype=dtype),
+                     xp.full((k,), MEMORY_EMPTY_AGE_S, dtype=dtype), xp.zeros((), dtype=dtype))
+
+
+def rotation_from_measurement(xp: ModuleType, gravity_body: Array, yaw: Array) -> Array:
+    """Body-to-world rotation Rz(yaw) Ry(pitch) Rx(roll) from the measured gravity direction and compass yaw."""
+    roll = xp.arctan2(-gravity_body[1], -gravity_body[2])
+    pitch = xp.arcsin(xp.clip(gravity_body[0], -1.0, 1.0))
+    cr, sr, cp, sp, cy, sy = xp.cos(roll), xp.sin(roll), xp.cos(pitch), xp.sin(pitch), xp.cos(yaw), xp.sin(yaw)
+    return xp.stack([
+        xp.stack([cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr]),
+        xp.stack([sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr]),
+        xp.stack([-sp, cp * sr, cp * cr]),
+    ])
+
+
+def memory_update(xp: ModuleType, mem: FanMemory, meas: NavMeasurement, sonar: SonarConfig, mem_cfg: MemoryConfig,
+                  dt_s: float) -> FanMemory:
+    """Move stored points by the measured displacement over dt_s, age them, and store the current fan every
+    stride_steps updates (dt_s = 0 at reset). Uses only measured quantities (DVL, attitude, compass, sonar)."""
+    rot = rotation_from_measurement(xp, meas.gravity_body, meas.yaw_rad)
+    v_world = _mv(xp, rot, meas.vel_body_mps)
+    points = mem.points_m - dt_s * v_world[None, None, :2]
+    age = mem.age_s + dt_s
+    dirs = fan_dirs_world(xp, sonar, rot, meas.sonar_range_m.dtype)
+    origin = _mv(xp, rot, xp.asarray(sonar.mount_pos_m, dtype=meas.sonar_range_m.dtype))
+    r = meas.sonar_range_m
+    new_points = origin[None, :2] + r[:, None] * dirs[:, :2]
+    new_valid = (r < min(mem_cfg.max_range_m, sonar.max_range_m - 1e-6)).astype(r.dtype)
+    insert = xp.mod(mem.count, mem_cfg.stride_steps) < 0.5
+    slot = xp.mod(xp.floor(mem.count / mem_cfg.stride_steps), mem_cfg.slots)
+    hit = (xp.asarray(np.arange(mem_cfg.slots), dtype=r.dtype) == slot) & insert  # (slots,)
+    return FanMemory(
+        points_m=xp.where(hit[:, None, None], new_points[None], points),
+        valid=xp.where(hit[:, None], new_valid[None], mem.valid),
+        age_s=xp.where(hit, 0.0, age),
+        count=mem.count + 1.0,
+    )
+
+
+def fan_dirs_world(xp: ModuleType, sonar: SonarConfig, rot: Array, dtype: Any) -> Array:
+    """World directions (num_beams, 3) of the fan row closest to zero elevation."""
+    dirs = sonar_dirs_body(sonar)
+    mid = int(np.argmin(np.abs(np.asarray(sonar.elevation_rows_rad))))
+    body = xp.asarray(dirs[mid * sonar.num_beams : (mid + 1) * sonar.num_beams], dtype=dtype)
+    return _pair_dot(xp, body, rot)
+
+
+def memory_polar(xp: ModuleType, mem: FanMemory, yaw: Array, mem_cfg: MemoryConfig, ctrl_dt_s: float) -> Array:
+    """Nearest remembered point per heading-relative sector, (sectors,) in [0, 1] (1 = nothing within range).
+
+    Sector 0 starts directly behind (-pi) and sectors run counter-clockwise (right side, front, left side).
+    """
+    px, py = mem.points_m[..., 0], mem.points_m[..., 1]
+    rng = xp.sqrt(px**2 + py**2)
+    ang = core.wrap_angle(xp, xp.arctan2(py, px) - yaw)
+    width = 2.0 * math.pi / mem_cfg.sectors
+    sector = xp.clip(xp.floor((ang + math.pi) / width), 0, mem_cfg.sectors - 1)
+    ok = (mem.valid > 0.5) & (mem.age_s[:, None] < memory_horizon_s(mem_cfg, ctrl_dt_s))
+    vals = xp.where(ok, rng, mem_cfg.max_range_m)
+    ids = xp.asarray(np.arange(mem_cfg.sectors), dtype=rng.dtype)
+    per = xp.where(sector[None] == ids[:, None, None], vals[None], mem_cfg.max_range_m)
+    return xp.minimum(xp.min(per, axis=(1, 2)), mem_cfg.max_range_m) / mem_cfg.max_range_m
 
 
 # --- low-level velocity control (shared by RL and the classical baseline) ----------------------------------
@@ -533,6 +696,7 @@ def nav_reward_and_done(
     dist_prev_m: Array,
     dist_now_m: Array,
     clearance: Array,
+    speed_mps: Array,
     cos_tilt: Array,
     thrust_action: Array,
     cmd: Array,
@@ -540,9 +704,13 @@ def nav_reward_and_done(
     finite: Array,
     cfg: NavRewardConfig,
 ) -> tuple[Array, NavOutcome, dict[str, Array]]:
-    """Per-step reward, outcome flags and reward terms. Timeouts are handled by the caller."""
+    """Per-step reward, outcome flags and reward terms. Timeouts are handled by the caller.
+
+    speed_mps: vehicle speed over ground (only used by the nav2 proximity-speed term).
+    """
     dt = thrust_action.dtype
     near = 1.0 - xp.clip(clearance, 0.0, cfg.safe_clearance_m) / cfg.safe_clearance_m
+    near_barrier = 1.0 - xp.clip(clearance, 0.0, cfg.barrier_clearance_m) / cfg.barrier_clearance_m
     terms = {
         "progress": cfg.w_progress_per_m * xp.nan_to_num(dist_prev_m - dist_now_m),
         "clearance": -cfg.w_clearance * near**2,
@@ -550,6 +718,9 @@ def nav_reward_and_done(
         "action_rate": -cfg.w_action_rate * xp.mean((cmd - last_cmd) ** 2),
         "time": -cfg.w_time * xp.ones((), dtype=dt),
         "tilt": -cfg.w_tilt * (1.0 - xp.nan_to_num(cos_tilt, nan=1.0)),
+        "barrier": -cfg.w_barrier * near_barrier**2,
+        "proximity_speed": -cfg.w_proximity_speed * near_barrier * xp.nan_to_num(speed_mps)
+        / cfg.proximity_speed_norm_mps,
     }
     collision = (clearance < 0.0) & finite
     failure = (cos_tilt < cfg.min_cos_tilt) | (~finite)

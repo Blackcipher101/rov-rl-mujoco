@@ -2,7 +2,8 @@
 
 iter_nav_frames(): chase camera behind and above the vehicle in the murky-water look of the control-task
 videos (fog / haze from the MJCF; fog end extended for the larger scene, see nav_cpu_env.NAV_FOG_END_M), the
-obstacle field, and scene markers that are not part of the physics: the measured sonar fan (one line per
+obstacle field, moving obstacles (orange capsules with trails), and scene markers that are not part of the
+physics: the measured sonar fan (one line per
 beam, coloured by range: red near -> yellow -> green far; beams with no echo faint cyan), the goal (green
 sphere), the start (yellow), the travelled path (white line) and the current vector (cyan arrow, as in
 rov_rl/render.py). Requires an OpenGL backend (headless: MUJOCO_GL=egl).
@@ -34,6 +35,8 @@ SONAR_LINE_WIDTH_PX = 2.5
 TRAIL_LINE_WIDTH_PX = 2.0
 TRAIL_STRIDE = 5  # control steps between trail vertices
 NO_ECHO_RGBA = np.array([0.4, 0.9, 1.0, 0.18])
+MOVER_RGBA = np.array([0.95, 0.55, 0.15, 1.0])
+MOVER_TRAIL_RGBA = np.array([0.95, 0.55, 0.15, 0.5])
 SEPARATOR_PX = 6
 
 
@@ -83,6 +86,9 @@ def iter_nav_frames(
     cam.distance = CAMERA_DISTANCE_M
     cam.elevation = CAMERA_ELEVATION_DEG
     cam_yaw = None
+    movers = np.flatnonzero(np.asarray(params.scene.mov_active) > 0.5)
+    mover_traj = np.stack([nav_core.mover_positions(np, params.scene, params.vehicle, k * ctrl_dt_s)
+                           for k in range(log.qpos.shape[0])])  # (steps + 1, M, 3)
     with mujoco.Renderer(model, height=height, width=width) as renderer:
         for i in range(0, log.qpos.shape[0], frame_stride):
             qpos = log.qpos[i]
@@ -109,7 +115,15 @@ def iter_nav_frames(
             for d_body, r in zip(fan_dirs, log.sonar_range_m[i]):
                 _line(scene, origin, origin + float(r) * (rot @ d_body), range_rgba(float(r), sonar.max_range_m),
                       SONAR_LINE_WIDTH_PX)
-            current = core.current_velocity(np, i * ctrl_dt_s, params.vehicle)
+            t_s = i * ctrl_dt_s
+            for k in movers:
+                _add_geom(scene, mujoco.mjtGeom.mjGEOM_CAPSULE,
+                          np.array([params.scene.mov_radius_m[k], params.scene.mov_half_height_m[k], 0.0]),
+                          mover_traj[i, k], eye, MOVER_RGBA)
+                trail = mover_traj[: i + 1 : TRAIL_STRIDE, k]
+                for a, b in zip(trail[:-1], trail[1:]):
+                    _line(scene, a, b, MOVER_TRAIL_RGBA, TRAIL_LINE_WIDTH_PX)
+            current = core.current_velocity(np, t_s, params.vehicle)
             _arrow(scene, qpos[:3] + np.array([0.0, 0.0, 0.6]), current * CURRENT_ARROW_M_PER_MPS,
                    np.array([0.2, 0.9, 1.0, 0.9]))
             frame = renderer.render().copy()
@@ -216,6 +230,17 @@ def plot_paths(params: nav_core.NavEpisode, logs: dict[str, NavEpisodeLog], path
     ax.add_patch(Circle((goal[0], goal[1]), goal_radius_m, fill=False, color="green", lw=1.5))
     ax.plot([0.0], [0.0], marker="o", color="gold", ms=9, label="start")
     ax.plot([goal[0]], [goal[1]], marker="*", color="green", ms=14, label="goal")
+    active = np.flatnonzero(np.asarray(sc.mov_active) > 0.5)
+    if active.size:
+        t_end = max(float(log.t_s[-1]) for log in logs.values())
+        ts = np.linspace(0.0, t_end, 400)
+        traj = np.stack([nav_core.mover_positions(np, sc, params.vehicle, t) for t in ts])  # (T, M, 3)
+        for n, k in enumerate(active):
+            ax.plot(traj[:, k, 0], traj[:, k, 1], ls="--", color="#e8892a", lw=1.2,
+                    label="moving obstacle path (t = 0 dot, end circle)" if n == 0 else None)
+            ax.plot([traj[0, k, 0]], [traj[0, k, 1]], marker="o", color="#e8892a", ms=4)
+            ax.add_patch(Circle((traj[-1, k, 0], traj[-1, k, 1]), float(sc.mov_radius_m[k]), fill=False,
+                                color="#e8892a", lw=1.5))
     colors = ["#1f77b4", "#d62728", "#9467bd", "#2ca02c"]
     for (name, log), color in zip(logs.items(), colors):
         xy = log.qpos[:, :2]

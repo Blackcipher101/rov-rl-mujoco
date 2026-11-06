@@ -26,10 +26,12 @@ import numpy as np
 from rov_rl import nav_core
 from rov_rl.config import (
     DISTURBANCE_LEVELS_MPS,
+    NAV2_CONFIG,
     NAV_CURRENT_LEVELS,
     NAV_DENSITY_LEVELS,
     NavConfig,
     nav_eval_scene,
+    nav_eval_scene_moving,
     nav_eval_vehicle,
 )
 from rov_rl.nav_baseline import DEFAULT_VFH_PATH, VfhParams, VfhPlanner
@@ -44,8 +46,11 @@ from rov_rl.nav_rollout import (
     run_nav_episode,
 )
 
-CONTROLLERS = ("baseline", "rl")
+CONTROLLERS = ("baseline", "baseline_decay", "rl")
 DENSITY_ORDER = ("low", "medium", "high")
+MOVER_SCENARIOS = ("static", "moving")
+DEFAULT_VFH_DECAY_PATH = DEFAULT_VFH_PATH.with_name("nav_baseline_decay.json")
+TASK_CONFIGS: dict[str, NavConfig] = {"nav": NavConfig(), "nav2": NAV2_CONFIG}
 TALLY_EVERY = 10
 
 
@@ -53,10 +58,15 @@ TALLY_EVERY = 10
 class NavCell:
     density: str
     level: int
+    movers: str = "static"
 
     @property
     def name(self) -> str:
-        return f"{self.density}_L{self.level}"
+        """Static cells keep the nav-task names (comparable results); moving cells get a "_mov" suffix."""
+        return f"{self.density}_L{self.level}" + ("_mov" if self.movers == "moving" else "")
+
+    def scene(self):
+        return nav_eval_scene_moving(self.density) if self.movers == "moving" else nav_eval_scene(self.density)
 
 
 def cell_episodes(env: NavCpuEnv, cell: NavCell, n: int, seed: int) -> list[tuple[nav_core.NavEpisode, int]]:
@@ -64,6 +74,8 @@ def cell_episodes(env: NavCpuEnv, cell: NavCell, n: int, seed: int) -> list[tupl
     out = []
     for i in range(n):
         key = [seed, DENSITY_ORDER.index(cell.density), cell.level, i]
+        if cell.movers == "moving":  # static cells keep the nav-task seeds
+            key = key + [MOVER_SCENARIOS.index(cell.movers)]
         noise_seed = int(np.random.default_rng(key + [1]).integers(2**31))
         out.append((env.sample_params(np.random.default_rng(key)), noise_seed))
     return out
@@ -93,12 +105,13 @@ def results_table(rows: list[dict[str, Any]], controllers: list[str]) -> str:
         else:
             const, amp = DISTURBANCE_LEVELS_MPS[r["level"]]
             current = f"{r['level']} ({const:.2f}/{amp:.2f})"
+        density = r["density"] + (" (moving)" if r.get("movers") == "moving" else "")
         for c in controllers:
             a = r["aggregate"].get(c)
             if a is None:
                 continue
             lines.append(
-                f"| {r['density']} | {current} | {c} | {a['success_rate']:.2f} | {a['collision_rate']:.2f} | "
+                f"| {density} | {current} | {c} | {a['success_rate']:.2f} | {a['collision_rate']:.2f} | "
                 f"{a['timeout_rate'] + a['failure_rate']:.2f} | {fmt(a['time_to_goal_s'], 1)} | "
                 f"{fmt(a['path_ratio'])} | {fmt(a['min_clearance_mean_m'])} / {fmt(a['min_clearance_worst_m'])} | "
                 f"{fmt(a['thrust_impulse_success_ns'], 0)} |"
@@ -110,22 +123,27 @@ def results_table(rows: list[dict[str, Any]], controllers: list[str]) -> str:
     return "\n".join(lines) + "\n" + note
 
 
-def load_rl(policy_dir: pathlib.Path, cfg: NavConfig) -> NavController:
+def load_rl(policy_dir: pathlib.Path, task: str, cfg: NavConfig) -> NavController:
     from rov_rl.policy_io import CONFIG_FILE, load_policy  # needs jax + brax
 
     net_cfg = json.loads((policy_dir / CONFIG_FILE).read_text(encoding="utf-8"))
-    expected = nav_core.nav_obs_size(cfg.sonar)
-    if net_cfg.get("task") != "nav" or net_cfg.get("observation_size") != expected or net_cfg.get("action_size") != 4:
-        raise ValueError(f"{policy_dir} is not a nav policy for this config (need task=nav, observation_size="
+    expected = nav_core.nav_obs_size(cfg.sonar, cfg.memory)
+    if net_cfg.get("task") != task or net_cfg.get("observation_size") != expected or net_cfg.get("action_size") != 4:
+        raise ValueError(f"{policy_dir} is not a {task} policy for this config (need task={task}, observation_size="
                          f"{expected}, action_size=4; got {net_cfg})")
     return NavPolicyController(load_policy(policy_dir))
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--controllers", default="baseline,rl", help="comma list of: baseline, rl")
-    parser.add_argument("--policy-dir", type=pathlib.Path, help="train.py --task nav output <run>/policy (for rl)")
+    parser.add_argument("--task", choices=sorted(TASK_CONFIGS), default="nav",
+                        help="observation / reward config of the RL policy (the baselines are unaffected)")
+    parser.add_argument("--controllers", default="baseline,rl", help="comma list of: " + ", ".join(CONTROLLERS))
+    parser.add_argument("--policy-dir", type=pathlib.Path, help="train.py --task nav|nav2 output <run>/policy")
     parser.add_argument("--baseline-params", type=pathlib.Path, default=DEFAULT_VFH_PATH)
+    parser.add_argument("--baseline-decay-params", type=pathlib.Path, default=DEFAULT_VFH_DECAY_PATH,
+                        help="VFH+ with log-odds decay (controller baseline_decay)")
+    parser.add_argument("--movers", default="static", help="comma list of: " + ", ".join(MOVER_SCENARIOS))
     parser.add_argument("--episodes", type=int, default=20, help="episodes per cell")
     parser.add_argument("--densities", default=",".join(DENSITY_ORDER))
     parser.add_argument("--current-levels", default=",".join(str(x) for x in NAV_CURRENT_LEVELS))
@@ -146,17 +164,24 @@ def main() -> None:
     if not set(densities) <= set(NAV_DENSITY_LEVELS):
         parser.error(f"--densities must be a comma list of {', '.join(DENSITY_ORDER)}")
     levels = [int(x) for x in args.current_levels.split(",") if x]
-    cells = [NavCell(d, lvl) for d in densities for lvl in levels]
+    movers = [m for m in args.movers.split(",") if m]
+    if not movers or not set(movers) <= set(MOVER_SCENARIOS):
+        parser.error(f"--movers must be a comma list of {', '.join(MOVER_SCENARIOS)}")
+    cells = [NavCell(d, lvl, mv) for mv in movers for d in densities for lvl in levels]
     video_cells = set() if args.no_video else {c for c in args.video_cells.split(",") if c}
     plot_cell = None if args.no_video else args.plot_cell
 
-    cfg = NavConfig()
+    cfg = TASK_CONFIGS[args.task]
     vfh_params = VfhParams.load(args.baseline_params)
     impls: dict[str, NavController] = {}
     if "baseline" in controllers:
-        impls["baseline"] = VfhController(VfhPlanner(vfh_params, cfg.sonar, cfg.command))
+        impls["baseline"] = VfhController(VfhPlanner(vfh_params, cfg.sonar, cfg.command, cfg.sim.ctrl_dt_s))
+    vfh_decay_params = VfhParams.load(args.baseline_decay_params) if "baseline_decay" in controllers else None
+    if vfh_decay_params is not None:
+        impls["baseline_decay"] = VfhController(VfhPlanner(vfh_decay_params, cfg.sonar, cfg.command,
+                                                           cfg.sim.ctrl_dt_s))
     if "rl" in controllers:
-        impls["rl"] = load_rl(args.policy_dir, cfg)
+        impls["rl"] = load_rl(args.policy_dir, args.task, cfg)
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     total = len(cells) * len(controllers) * args.episodes
@@ -167,9 +192,10 @@ def main() -> None:
     all_metrics: dict[str, list[dict[str, Any]]] = {c: [] for c in controllers}
     t_run = time.monotonic()
     for cell in cells:
-        env = NavCpuEnv(nav_eval_vehicle(cell.level), nav_eval_scene(cell.density), cfg)
+        env = NavCpuEnv(nav_eval_vehicle(cell.level), cell.scene(), cfg)
         episodes = cell_episodes(env, cell, args.episodes, args.seed)
-        row: dict[str, Any] = {"density": cell.density, "level": cell.level, "aggregate": {}, "episodes": {}}
+        row: dict[str, Any] = {"density": cell.density, "level": cell.level, "movers": cell.movers,
+                               "aggregate": {}, "episodes": {}}
         kept: dict[str, NavEpisodeLog] = {}
         for name in controllers:
             per_ep = []
@@ -207,7 +233,9 @@ def main() -> None:
         if kept:
             write_media(args.out_dir, cell, episodes[0][0], kept, cfg, video_cells, plot_cell, args.frame_stride)
         summary = {"density": "all", "level": -1, "aggregate": {c: aggregate_nav(all_metrics[c]) for c in controllers}}
-        meta = {"controllers": controllers, "episodes_per_cell": args.episodes, "seed": args.seed,
+        meta = {"task": args.task, "controllers": controllers, "episodes_per_cell": args.episodes, "seed": args.seed,
+                "movers": movers,
+                "baseline_decay_params": dataclasses.asdict(vfh_decay_params) if vfh_decay_params else None,
                 "policy_dir": str(args.policy_dir) if args.policy_dir else None,
                 "baseline_params": dataclasses.asdict(vfh_params), "nav_config": dataclasses.asdict(cfg),
                 "density_levels": NAV_DENSITY_LEVELS, "disturbance_levels_mps": DISTURBANCE_LEVELS_MPS,
@@ -225,7 +253,8 @@ def write_media(out_dir: pathlib.Path, cell: NavCell, params: nav_core.NavEpisod
 
     if cell.name == plot_cell:
         path = out_dir / f"paths_{cell.name}.png"
-        plot_paths(params, logs, path, f"nav field {cell.name}: density {cell.density}, current level {cell.level}",
+        title = f"nav field {cell.name}: density {cell.density}, current level {cell.level}, {cell.movers} obstacles"
+        plot_paths(params, logs, path, title,
                    cfg.reward.goal_radius_m)
         print(f"[nav_eval] plot -> {path}", flush=True)
     if cell.name in video_cells:
