@@ -6,7 +6,7 @@ episodes. The repo covers station keeping in currents, 3D waypoint tracking with
 and robustness to plant changes and thruster failure. Videos come from a chase camera
 with a murky-water look.
 
-[![PID vs RL under current, plant randomisation and thruster failure](docs/media/rov_pid_vs_rl_poster.jpg)](docs/media/rov_pid_vs_rl_combined.mp4)
+[![PID vs RL under current, plant randomisation and thruster failure (animated)](docs/media/rov_pid_vs_rl.gif)](docs/media/rov_pid_vs_rl_combined.mp4)
 
 *Left: tuned PID. Right: RL. Trajectory tracking in a 0.2 m/s current, with plant randomisation and a thruster failure
 ([mp4](docs/media/rov_pid_vs_rl_combined.mp4)).*
