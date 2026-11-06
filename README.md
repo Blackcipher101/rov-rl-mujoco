@@ -6,10 +6,15 @@ episodes. The repo covers station keeping in currents, 3D waypoint tracking with
 and robustness to plant changes and thruster failure. Videos come from a chase camera
 with a murky-water look.
 
-> **Status.** The CPU physics, the PID baseline and the unit tests have been run on a
-> laptop (see "Verification"). **No RL training has been run yet**, so the results table
-> below is empty on purpose. Fill it only from `runs/full/eval/results.md` produced by
-> `scripts/run_ws1.sh`.
+[![PID vs RL under current, plant randomisation and thruster failure](docs/media/rov_pid_vs_rl_poster.jpg)](docs/media/rov_pid_vs_rl_combined.mp4)
+
+*Left: tuned PID. Right: RL. Trajectory tracking in a 0.2 m/s current, with plant randomisation and a thruster failure
+([mp4](docs/media/rov_pid_vs_rl_combined.mp4)).*
+
+**Headline (20 episodes per cell, CPU MuJoCo evaluation):** in calm water the tuned PID is more precise
+(station keeping 0.001 m vs 0.007 m RMS). As disturbances grow, the RL policy matches it and then beats it:
+- 0.4 m/s current, tracking (outside the 0.35 m/s training range): RL **0.048 m** RMS, 100 % success; PID 0.131 m, 90 %.
+- All disturbances combined, tracking: RL **0.041 m**, 100 %; PID 0.058 m, 90 %, with 10 % of episodes terminated.
 
 ## Layout
 
@@ -197,17 +202,48 @@ Outputs:
 
 ## Results
 
-*No measured results yet.* After `scripts/run_ws1.sh full`, paste
-`runs/full/eval/results.md` here together with:
-* the git revision recorded in `runs/full/run_config.json`
-* the number of training steps
-* the wall-clock time
+Measured on workstation1 (RTX 5080), 2026-11-06, with `scripts/run_ws1.sh full`:
+- **Code:** repo state `abab31a`. The run config records the revision as "unknown" because the tree was synced without `.git`.
+- **Training:** PPO with domain randomisation, 165 M env steps in 411 s, including a 27 s JIT compile.
+- **Evaluation:** CPU MuJoCo (float64), 20 episodes per cell, run on the same seeds and episodes for PID and RL.
+- **Levels:** level 4 (0.4 m/s) is deliberately outside the training range.
 
-Do not enter numbers that were not produced by that pipeline.
-
-| task | scenario | level | controller | pos RMS [m] | pos max [m] | settling [s] | thrust impulse [N s] | success | terminated |
+| task | scenario | level (current const/amp m/s) | controller | pos RMS [m] | pos max [m] | settling [s] | thrust impulse [N s] | success | terminated |
 |---|---|---|---|---|---|---|---|---|---|
-| (not yet run) | | | | | | | | | |
+| station | nominal | 0 (0.00/0.00) | pid | 0.001 | 0.003 | 1.3 | 199 | 1.00 | 0.00 |
+| station | nominal | 0 (0.00/0.00) | rl | 0.007 | 0.015 | 1.3 | 404 | 1.00 | 0.00 |
+| station | nominal | 1 (0.10/0.03) | pid | 0.003 | 0.005 | 1.4 | 391 | 1.00 | 0.00 |
+| station | nominal | 1 (0.10/0.03) | rl | 0.009 | 0.018 | 1.5 | 481 | 1.00 | 0.00 |
+| station | nominal | 2 (0.20/0.06) | pid | 0.009 | 0.014 | 1.4 | 846 | 1.00 | 0.00 |
+| station | nominal | 2 (0.20/0.06) | rl | 0.009 | 0.016 | 1.4 | 860 | 1.00 | 0.00 |
+| station | nominal | 3 (0.30/0.09) | pid | 0.016 | 0.024 | 1.6 | 1545 | 1.00 | 0.00 |
+| station | nominal | 3 (0.30/0.09) | rl | 0.013 | 0.024 | 1.6 | 1541 | 1.00 | 0.00 |
+| station | nominal | 4 (0.40/0.12) | pid | 0.025 | 0.038 | 2.2 | 2536 | 1.00 | 0.00 |
+| station | nominal | 4 (0.40/0.12) | rl | 0.020 | 0.038 | 2.3 | 2472 | 1.00 | 0.00 |
+| track | nominal | 0 (0.00/0.00) | pid | 0.024 | 0.281 | 0.4 | 797 | 1.00 | 0.00 |
+| track | nominal | 0 (0.00/0.00) | rl | 0.026 | 0.282 | 0.4 | 824 | 1.00 | 0.00 |
+| track | nominal | 1 (0.10/0.03) | pid | 0.025 | 0.271 | 0.5 | 924 | 1.00 | 0.00 |
+| track | nominal | 1 (0.10/0.03) | rl | 0.026 | 0.272 | 1.5 | 908 | 1.00 | 0.00 |
+| track | nominal | 2 (0.20/0.06) | pid | 0.031 | 0.306 | 1.3 | 1259 | 1.00 | 0.00 |
+| track | nominal | 2 (0.20/0.06) | rl | 0.029 | 0.306 | 1.0 | 1208 | 1.00 | 0.00 |
+| track | nominal | 3 (0.30/0.09) | pid | 0.044 | 0.310 | 3.3 | 1795 | 1.00 | 0.00 |
+| track | nominal | 3 (0.30/0.09) | rl | 0.033 | 0.295 | 2.1 | 1724 | 1.00 | 0.00 |
+| track | nominal | 4 (0.40/0.12) | pid | 0.131 | 0.485 | 15.1 | 2746 | 0.90 | 0.00 |
+| track | nominal | 4 (0.40/0.12) | rl | 0.048 | 0.295 | 9.3 | 2543 | 1.00 | 0.00 |
+| station | params | 2 (0.20/0.06) | pid | 0.010 | 0.016 | 1.5 | 937 | 1.00 | 0.00 |
+| station | params | 2 (0.20/0.06) | rl | 0.011 | 0.020 | 1.6 | 925 | 1.00 | 0.00 |
+| station | thruster_failure | 2 (0.20/0.06) | pid | 0.015 | 0.028 | 1.4 | 867 | 1.00 | 0.00 |
+| station | thruster_failure | 2 (0.20/0.06) | rl | 0.013 | 0.021 | 1.4 | 891 | 1.00 | 0.00 |
+| station | combined | 2 (0.20/0.06) | pid | 0.018 | 0.035 | 2.3 | 926 | 1.00 | 0.00 |
+| station | combined | 2 (0.20/0.06) | rl | 0.013 | 0.024 | 3.7 | 944 | 1.00 | 0.00 |
+| track | params | 2 (0.20/0.06) | pid | 0.033 | 0.299 | 2.2 | 1475 | 1.00 | 0.00 |
+| track | params | 2 (0.20/0.06) | rl | 0.030 | 0.297 | 1.0 | 1388 | 1.00 | 0.00 |
+| track | thruster_failure | 2 (0.20/0.06) | pid | 0.039 | 0.295 | 10.8 | 1287 | 0.95 | 0.05 |
+| track | thruster_failure | 2 (0.20/0.06) | rl | 0.030 | 0.293 | 8.0 | 1335 | 1.00 | 0.00 |
+| track | combined | 2 (0.20/0.06) | pid | 0.058 | 0.307 | 10.0 | 1412 | 0.90 | 0.10 |
+| track | combined | 2 (0.20/0.06) | rl | 0.041 | 0.290 | 8.5 | 1470 | 1.00 | 0.00 |
+
+Raw output: [`docs/results_full.md`](docs/results_full.md). Videos: [`docs/media/`](docs/media/).
 
 ## Verification performed so far
 
