@@ -304,6 +304,16 @@ obstacle field, using only a simulated forward-looking sonar and the usual navig
 (MJX + Brax PPO) is compared with a classical VFH+ planner. Both see the same sensor data, run on the same
 episodes, and drive the same velocity controller.
 
+![RL (left) vs VFH+ (right) navigating with sonar through pillars and pipe spans](docs/media/nav/nav_rl_vs_vfh.gif)
+
+*Left: RL. Right: VFH+. The sonar fan is coloured by range ([mp4](docs/media/nav/nav_medium_L0_rl_vs_baseline.mp4)).
+The GIF is sped up 2x.*
+
+**Result: mixed.** The RL policy reaches the goal **13 % faster**, on a **more direct path** (1.05 vs 1.25 times the
+straight-line distance) and with **15 % less thrust**. But it collides in 22 % of episodes, while the classical VFH+
+planner collides in none and succeeds in 99 %. RL learned to cut corners and keeps too little margin (mean minimum
+clearance 0.37 m vs 0.98 m), most of all in dense fields with current. See "Nav results" below.
+
 ### Scene
 
 * **Layout:** start at the origin, facing the goal within +-0.6 rad. The goal bearing is random, its height
@@ -427,19 +437,51 @@ MJRL_VENV=~/.venvs/mjrl scripts/run_ws1.sh nav_full    # 300 M-step training, fu
 tail -f runs/nav_full/train.log runs/nav_full/nav_eval.log
 ```
 
-### Status
+### Nav results
 
-* **Run on the laptop** (CPU, mujoco 3.17.0, numpy 1.26.4, no JAX):
-  * the full pytest suite, including the nav tests. Rays agree with `mujoco.mj_ray`; the MJX parity tests
-    are skipped.
-  * baseline tuning and baseline-only evaluation smoke runs
-  * EGL rendering of nav frames and the overhead plot
-* **Not run yet:**
-  * the MJX nav env and the nav parity tests
-  * PPO training on the nav task
-  * the RL evaluation
-  * MP4 encoding of nav videos
-* **No nav results are reported yet.**
+Measured on workstation1 (RTX 5080), 2026-11-06, with `scripts/run_ws1.sh nav_full`:
+- **Training:** PPO, 300 M env steps (about 9 min of training).
+- **Evaluation:** CPU env, 20 episodes per cell, the same seeds for both controllers (eval seed 2024; the baseline
+  was tuned on seed 7).
+- **Physics parity:** the MJX/CPU parity tests (`tests/test_nav_mjx_parity.py`) pass on the GPU.
+  - Ray geometry agrees to 0.2 mm after the elementwise rewrite.
+  - In the open-loop part of the test, a single beam may flip at an obstacle silhouette because of float32
+    state drift. The test checks that the CPU ray code re-cast at the MJX pose explains that beam.
+
+| density | current (const/amp m/s) | controller | success | collision | timeout | time to goal [s] | path ratio | min clearance mean / worst [m] | thrust impulse [N s] |
+|---|---|---|---|---|---|---|---|---|---|
+| low | 0 (0.00/0.00) | baseline | 1.00 | 0.00 | 0.00 | 44.2 | 1.11 | 1.18 / 0.54 | 5449 |
+| low | 0 (0.00/0.00) | rl | 0.90 | 0.10 | 0.00 | 39.8 | 1.01 | 0.68 / -0.02 | 4760 |
+| low | 2 (0.20/0.06) | baseline | 1.00 | 0.00 | 0.00 | 45.6 | 1.09 | 1.17 / 0.42 | 6304 |
+| low | 2 (0.20/0.06) | rl | 0.90 | 0.10 | 0.00 | 42.8 | 1.01 | 0.77 / -0.02 | 5783 |
+| low | 3 (0.30/0.09) | baseline | 1.00 | 0.00 | 0.00 | 48.5 | 1.10 | 1.10 / 0.38 | 6737 |
+| low | 3 (0.30/0.09) | rl | 0.85 | 0.15 | 0.00 | 49.9 | 1.01 | 0.68 / -0.01 | 6721 |
+| medium | 0 (0.00/0.00) | baseline | 1.00 | 0.00 | 0.00 | 44.9 | 1.21 | 1.09 / 0.47 | 5535 |
+| medium | 0 (0.00/0.00) | rl | 0.95 | 0.05 | 0.00 | 38.6 | 1.03 | 0.35 / -0.00 | 4548 |
+| medium | 2 (0.20/0.06) | baseline | 1.00 | 0.00 | 0.00 | 48.0 | 1.34 | 1.10 / 0.33 | 6094 |
+| medium | 2 (0.20/0.06) | rl | 0.80 | 0.20 | 0.00 | 40.5 | 1.07 | 0.22 / -0.01 | 5113 |
+| medium | 3 (0.30/0.09) | baseline | 0.95 | 0.00 | 0.05 | 57.3 | 1.35 | 0.75 / 0.24 | 7785 |
+| medium | 3 (0.30/0.09) | rl | 0.65 | 0.35 | 0.00 | 44.8 | 1.09 | 0.25 / -0.02 | 5929 |
+| high | 0 (0.00/0.00) | baseline | 1.00 | 0.00 | 0.00 | 53.6 | 1.34 | 0.90 / 0.42 | 6507 |
+| high | 0 (0.00/0.00) | rl | 0.75 | 0.25 | 0.00 | 43.0 | 1.07 | 0.11 / -0.01 | 4956 |
+| high | 2 (0.20/0.06) | baseline | 1.00 | 0.00 | 0.00 | 56.0 | 1.35 | 0.75 / 0.39 | 7188 |
+| high | 2 (0.20/0.06) | rl | 0.45 | 0.55 | 0.00 | 46.8 | 1.08 | 0.08 / -0.01 | 5990 |
+| high | 3 (0.30/0.09) | baseline | 0.95 | 0.00 | 0.05 | 58.6 | 1.35 | 0.75 / 0.31 | 8240 |
+| high | 3 (0.30/0.09) | rl | 0.80 | 0.20 | 0.00 | 52.5 | 1.11 | 0.19 / -0.01 | 7152 |
+| all | all | baseline | 0.99 | 0.00 | 0.01 | 50.7 | 1.25 | 0.98 / 0.24 | 6633 |
+| all | all | rl | 0.78 | 0.22 | 0.00 | 44.0 | 1.05 | 0.37 / -0.02 | 5617 |
+
+success / collision / timeout: fractions of all episodes (timeout includes tilt failures). Time to goal, path ratio (path length / straight start-goal distance) and thrust impulse: mean over successful episodes. Min clearance: true gap between the vehicle bounding sphere and the nearest obstacle or the seabed, per episode; mean and worst over all episodes.
+
+![Paths of both controllers through one high-density field](docs/media/nav/paths_high_L2.png)
+
+**What would likely fix the RL collisions:**
+- give the policy memory, with fan frame stacking or a recurrent policy, so it remembers obstacles that have left
+  the 120 deg fan;
+- a stronger clearance penalty, or a safety filter;
+- curriculum training on dense fields.
+
+None of these has been run yet.
 
 ### Nav-task limitations
 
