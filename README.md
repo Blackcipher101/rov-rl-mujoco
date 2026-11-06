@@ -3,10 +3,20 @@
 Reinforcement learning for an underwater ROV in MuJoCo, compared head to head with classical controllers. The
 vehicle is a BlueROV2-Heavy-like model in MuJoCo's fluid model, trained with MJX + Brax PPO on one RTX 5080.
 
-| Station keeping & tracking: PID (left) vs RL (right) | Sonar navigation with moving obstacles: RL (left) vs VFH+ (right) |
+**Sonar-only obstacle avoidance: RL (left) vs the VFH+ planner (right)**, same field, same moving obstacles:
+
+[![nav2 RL vs VFH+, overhead](docs/media/nav2/nav2_overhead_rl_vs_vfh.gif)](docs/media/nav2/nav2_overhead_rl_vs_vfh.mp4)
+
+*Overhead map, 4x real time. The blue fan is the sonar, the controller's only obstacle sensing. Orange discs are moving
+obstacles, and the field has a 0.2 m/s current. RL threads straight through the field and reaches the goal in 54 s with
+a path 1.14 times the straight line; VFH+ detours around the field and takes 65 s with a path 1.30 times the straight
+line. Clearance is live in each panel title.
+[mp4](docs/media/nav2/nav2_overhead_rl_vs_vfh.mp4)*
+
+| Station keeping & tracking: PID (left) vs RL (right) | Same navigation run from the chase camera |
 |---|---|
 | [![PID vs RL](docs/media/rov_pid_vs_rl.gif)](docs/media/rov_pid_vs_rl_combined.mp4) | [![nav2 RL vs VFH+](docs/media/nav2/nav2_rl_vs_vfh_moving.gif)](docs/media/nav2/nav2_high_L2_mov_rl_vs_vfh.mp4) |
-| 0.2 m/s current, plant randomisation, thruster failure ([mp4](docs/media/rov_pid_vs_rl_combined.mp4)) | dense field, current, moving obstacles, sonar only ([mp4](docs/media/nav2/nav2_high_L2_mov_rl_vs_vfh.mp4)) |
+| 0.2 m/s current, plant randomisation, thruster failure ([mp4](docs/media/rov_pid_vs_rl_combined.mp4)) | dense field, current, moving obstacles ([mp4](docs/media/nav2/nav2_high_L2_mov_rl_vs_vfh.mp4)) |
 
 ## Results
 

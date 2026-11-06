@@ -153,6 +153,8 @@ def main() -> None:
     parser.add_argument("--video-cells", default="high_L2,medium_L0", help="cells to film (first episode)")
     parser.add_argument("--plot-cell", default="high_L2", help="cell whose first field is plotted overhead")
     parser.add_argument("--frame-stride", type=int, default=2, help="control steps per video frame")
+    parser.add_argument("--animate-map", action="store_true",
+                        help="also write an animated overhead map (paths_<plot-cell>.mp4) of the plotted episode")
     args = parser.parse_args()
 
     controllers = [c for c in args.controllers.split(",") if c]
@@ -231,7 +233,8 @@ def main() -> None:
             all_metrics[name].extend(per_ep)
         rows.append(row)
         if kept:
-            write_media(args.out_dir, cell, episodes[0][0], kept, cfg, video_cells, plot_cell, args.frame_stride)
+            write_media(args.out_dir, cell, episodes[0][0], kept, cfg, video_cells, plot_cell, args.frame_stride,
+                        args.animate_map)
         summary = {"density": "all", "level": -1, "aggregate": {c: aggregate_nav(all_metrics[c]) for c in controllers}}
         meta = {"task": args.task, "controllers": controllers, "episodes_per_cell": args.episodes, "seed": args.seed,
                 "movers": movers,
@@ -248,8 +251,9 @@ def main() -> None:
 
 
 def write_media(out_dir: pathlib.Path, cell: NavCell, params: nav_core.NavEpisode, logs: dict[str, NavEpisodeLog],
-                cfg: NavConfig, video_cells: set[str], plot_cell: str | None, frame_stride: int) -> None:
-    from rov_rl.nav_render import plot_paths, write_nav_videos
+                cfg: NavConfig, video_cells: set[str], plot_cell: str | None, frame_stride: int,
+                animate_map: bool = False) -> None:
+    from rov_rl.nav_render import animate_paths, plot_paths, write_nav_videos
 
     if cell.name == plot_cell:
         path = out_dir / f"paths_{cell.name}.png"
@@ -257,6 +261,10 @@ def write_media(out_dir: pathlib.Path, cell: NavCell, params: nav_core.NavEpisod
         plot_paths(params, logs, path, title,
                    cfg.reward.goal_radius_m)
         print(f"[nav_eval] plot -> {path}", flush=True)
+        if animate_map:
+            anim = animate_paths(params, logs, out_dir / f"paths_{cell.name}.mp4", title, cfg.reward.goal_radius_m,
+                                 cfg.sonar, cfg.sim.ctrl_dt_s)
+            print(f"[nav_eval] animated map -> {anim}", flush=True)
     if cell.name in video_cells:
         for path in write_nav_videos(out_dir, f"nav_{cell.name}", params, logs, cfg.sonar, cfg.sim.ctrl_dt_s,
                                      frame_stride, pair=("rl", "baseline")):

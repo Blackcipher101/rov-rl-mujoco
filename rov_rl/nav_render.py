@@ -200,18 +200,12 @@ def _capsule_footprint(a: np.ndarray, b: np.ndarray, radius_m: float) -> np.ndar
     return np.concatenate([end_b, end_a], axis=0)
 
 
-def plot_paths(params: nav_core.NavEpisode, logs: dict[str, NavEpisodeLog], path: pathlib.Path, title: str,
-               goal_radius_m: float) -> None:
-    """Overhead plot: obstacle footprints, start, goal (with goal radius) and each controller's path."""
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+def _draw_field(ax, params: nav_core.NavEpisode, goal_radius_m: float) -> None:
+    """Static part of the overhead plot: obstacle footprints, start and goal."""
     from matplotlib.patches import Circle, Polygon
 
     sc = params.scene
     start_z = float(params.vehicle.start_pos_m[2])
-    fig, ax = plt.subplots(figsize=(8, 8))
     for i in np.flatnonzero(np.asarray(sc.cap_active) > 0.5):
         a, b, r = np.asarray(sc.cap_a_m[i]), np.asarray(sc.cap_b_m[i]), float(sc.cap_radius_m[i])
         if sc.cap_is_pipe[i] > 0.5:
@@ -230,6 +224,20 @@ def plot_paths(params: nav_core.NavEpisode, logs: dict[str, NavEpisodeLog], path
     ax.add_patch(Circle((goal[0], goal[1]), goal_radius_m, fill=False, color="green", lw=1.5))
     ax.plot([0.0], [0.0], marker="o", color="gold", ms=9, label="start")
     ax.plot([goal[0]], [goal[1]], marker="*", color="green", ms=14, label="goal")
+
+
+def plot_paths(params: nav_core.NavEpisode, logs: dict[str, NavEpisodeLog], path: pathlib.Path, title: str,
+               goal_radius_m: float) -> None:
+    """Overhead plot: obstacle footprints, start, goal (with goal radius) and each controller's path."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+
+    sc = params.scene
+    fig, ax = plt.subplots(figsize=(8, 8))
+    _draw_field(ax, params, goal_radius_m)
     active = np.flatnonzero(np.asarray(sc.mov_active) > 0.5)
     if active.size:
         t_end = max(float(log.t_s[-1]) for log in logs.values())
@@ -256,3 +264,88 @@ def plot_paths(params: nav_core.NavEpisode, logs: dict[str, NavEpisodeLog], path
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=130, bbox_inches="tight")
     plt.close(fig)
+
+
+def animate_paths(params: nav_core.NavEpisode, logs: dict[str, NavEpisodeLog], path: pathlib.Path, title: str,
+                  goal_radius_m: float, sonar: SonarConfig, ctrl_dt_s: float, frame_stride: int = 5,
+                  speedup: float = 4.0) -> pathlib.Path:
+    """Animated overhead map, one panel per controller, all on the same field and clock.
+
+    Each panel shows the obstacle footprints, the moving obstacles at the current time, the vehicle (arrow) with the
+    measured sonar fan (the controller's only obstacle sensing), and its trail; a panel freezes at its outcome.
+    Playback is `speedup` x real time. Requires imageio + imageio-ffmpeg.
+    """
+    import imageio.v2 as imageio
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+
+    names = list(logs)
+    sc = params.scene
+    dirs = nav_core.sonar_dirs_body(sonar)
+    mid_row = int(np.argmin(np.abs(np.asarray(sonar.elevation_rows_rad))))
+    fan_dirs = dirs[mid_row * sonar.num_beams : (mid_row + 1) * sonar.num_beams]
+    mount = np.asarray(sonar.mount_pos_m)
+    active = np.flatnonzero(np.asarray(sc.mov_active) > 0.5)
+    n_steps = max(log.qpos.shape[0] for log in logs.values())
+    fig, axes = plt.subplots(1, len(names), figsize=(6.4 * len(names), 6.4), squeeze=False)
+    axes = axes[0]
+    colors = ["#d62728", "#1f77b4", "#9467bd", "#2ca02c"]
+    goal = np.asarray(sc.goal_m)
+    xs = np.concatenate([log.qpos[:, 0] for log in logs.values()] + [[0.0, goal[0]]])
+    ys = np.concatenate([log.qpos[:, 1] for log in logs.values()] + [[0.0, goal[1]]])
+    pad = 3.0
+    lim = (xs.min() - pad, xs.max() + pad, ys.min() - pad, ys.max() + pad)
+    artists = []
+    for ax, name, color in zip(axes, names, colors):
+        _draw_field(ax, params, goal_radius_m)
+        ax.set_xlim(lim[0], lim[1])
+        ax.set_ylim(lim[2], lim[3])
+        ax.set_aspect("equal")
+        ax.grid(alpha=0.25)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        movers = [ax.add_patch(Circle((0.0, 0.0), float(sc.mov_radius_m[k]), color="#e8892a", alpha=0.9, zorder=4))
+                  for k in active]
+        fan = [ax.plot([], [], lw=0.7, color="#29b6f6", alpha=0.55, zorder=3)[0] for _ in fan_dirs]
+        trail, = ax.plot([], [], color=color, lw=2.2, zorder=5)
+        body = ax.add_patch(Circle((0.0, 0.0), nav_core.VEHICLE_BOUNDING_RADIUS_M, color=color, zorder=6))
+        nose, = ax.plot([], [], color="black", lw=2.0, zorder=7)
+        label = ax.set_title("", fontsize=11)
+        artists.append((movers, fan, trail, body, nose, label))
+    fig.suptitle(title, fontsize=12)
+    fig.tight_layout()
+    fps = speedup / (ctrl_dt_s * frame_stride)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    writer = imageio.get_writer(path, fps=fps, codec="libx264", quality=7, macro_block_size=8)
+    try:
+        for i in range(0, n_steps, frame_stride):
+            t_s = i * ctrl_dt_s
+            mov = nav_core.mover_positions(np, sc, params.vehicle, t_s) if active.size else None
+            for (movers, fan, trail, body, nose, label), name in zip(artists, names):
+                log = logs[name]
+                k = min(i, log.qpos.shape[0] - 1)  # freeze at the end of a finished episode
+                qpos = log.qpos[k]
+                rot = core.quat_to_mat(np, qpos[3:7])
+                for m, idx in zip(movers, active):
+                    m.center = (float(mov[idx, 0]), float(mov[idx, 1]))
+                origin = qpos[:3] + rot @ mount
+                for line, d_body, r in zip(fan, fan_dirs, log.sonar_range_m[k]):
+                    end = origin + float(r) * (rot @ d_body)
+                    line.set_data([origin[0], end[0]], [origin[1], end[1]])
+                trail.set_data(log.qpos[: k + 1, 0], log.qpos[: k + 1, 1])
+                body.center = (float(qpos[0]), float(qpos[1]))
+                head = qpos[:3] + rot @ np.array([0.7, 0.0, 0.0])
+                nose.set_data([qpos[0], head[0]], [qpos[1], head[1]])
+                done = k == log.qpos.shape[0] - 1
+                status = f" - {log.outcome}" if done else ""
+                label.set_text(f"{name}   t = {min(t_s, float(log.t_s[-1])):5.1f} s   "
+                               f"clearance {float(log.clearance_m[k]):4.2f} m{status}")
+            fig.canvas.draw()
+            writer.append_data(np.asarray(fig.canvas.buffer_rgba())[:, :, :3])
+    finally:
+        writer.close()
+        plt.close(fig)
+    return path

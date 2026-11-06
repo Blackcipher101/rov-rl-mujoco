@@ -262,6 +262,8 @@ current. nav2 tries to close that gap while keeping most of the speed. It also a
 
 ### nav2 results
 
+Overhead animation of one dense field with moving obstacles: [media/nav2/nav2_overhead_rl_vs_vfh.mp4](media/nav2/nav2_overhead_rl_vs_vfh.mp4) (rendered with `eval_nav.py --animate-map`).
+
 ![nav2 RL (left) vs VFH+ (right) through a dense field with moving obstacles](media/nav2/nav2_rl_vs_vfh_moving.gif)
 
 *Left: nav2 RL. Right: VFH+. Dense field, 0.2 m/s current, moving obstacles; GIF at 2x
